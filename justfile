@@ -105,6 +105,17 @@ appimage: build
 appimage-boot distro="debian:12":
     docker run --rm -v "$PWD/dist:/dist:ro" -v "$PWD/packaging/appimage:/pk:ro" {{distro}} bash /pk/boot-test.sh "/dist/$(basename "$(ls dist/*.AppImage)")"
 
+# Build the .deb and .rpm in the pinned container, as release.yml does (needs
+# docker). Thin packages: the distro supplies Python, GTK and the typelibs;
+# only pywhispercpp and pynput are vendored.
+native-packages: build
+    bash packaging/native/docker-build.sh dist/*.whl "$(grep -oP '__version__\s*=\s*"\K[^"]+' src/vocalinux/version.py)" dist
+
+# Install the built package in a matching distro container, as the CI matrix
+# does: debian:12 / ubuntu:24.04 exercise the .deb, fedora:42 the .rpm.
+native-smoke distro="debian:12":
+    docker run --rm -v "$PWD/dist:/out:ro" -v "$PWD/packaging/native:/pk:ro" {{distro}} bash /pk/smoke-test.sh
+
 # Build the AUR package from this checkout on current Arch, as the CI gate
 # does. Answers "does this commit build on Arch" — the tag tarball source= is
 # swapped for a git archive of HEAD (needs docker).
@@ -140,6 +151,23 @@ install-gate distro="debian:12":
     fi
     docker run "${ARGS[@]}" {{distro}} bash "$PWD/scripts/install-test.sh"
 
+# Run install.sh's remote path end to end in a distro container, as the CI gate
+# does: bootstrap outside a checkout, tag selection, clone/fetch of a mirror
+# published from HEAD, handoff to the tagged installer. Answers "does the
+# public curl|bash path install this commit" (needs docker). Same worktree
+# handling as install-gate above.
+#
+# Usage: `just remote-install-gate` for debian:12, or `just remote-install-gate fedora:42`
+remote-install-gate distro="debian:12":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    COMMON="$(cd "$(git rev-parse --git-common-dir)" && pwd)"
+    ARGS=(--rm -v "$PWD:$PWD:ro" -e REPO="$PWD")
+    if [ "$COMMON" != "$PWD/.git" ]; then
+        ARGS+=(-v "$COMMON:$COMMON:ro")
+    fi
+    docker run "${ARGS[@]}" {{distro}} bash "$PWD/scripts/install-remote-test.sh"
+
 # Check that a published release verifies as published: manifest, provenance,
 # notes and PyPI digests. Needs gh, downloads nothing.
 # Usage: `just verify-release` for the latest, or `just verify-release v0.17.0`
@@ -147,10 +175,11 @@ verify-release tag="":
     python3 scripts/verify_release.py {{tag}}
 
 # Regenerate uv.lock and the hash-pinned requirements/* exports.
-# Bump the torch/torchaudio +cpu pins in requirements/whisper.in together
-# when you want newer CPU builds (torchaudio on the CPU index lags torch).
+# Bump the torch +cpu pin in requirements/whisper.in when you want a newer
+# CPU build. OpenAI Whisper does not use torchaudio, whose CPU index can lag.
 lock:
     uv lock
+    uv export --only-group installer-build --no-emit-project -o requirements/installer-build.txt
     uv export --no-dev --no-emit-project --no-emit-package pygobject -o requirements/runtime.txt
     uv export --no-dev --extra vad --no-emit-project --no-emit-package pygobject -o requirements/vad.txt
     # One export per selectable engine. install.sh installs each of these as an
@@ -168,7 +197,8 @@ lock:
     uv pip compile requirements/whisper.in --generate-hashes --emit-index-url \
         --index-url https://pypi.org/simple \
         --extra-index-url https://download.pytorch.org/whl/cpu \
-        --python-platform x86_64-unknown-linux-gnu -o requirements/whisper.txt
+        --index-strategy unsafe-best-match --universal --python-version 3.11 \
+        -c requirements/runtime.txt -c requirements/installer-build.txt -o requirements/whisper.txt
     # Compiled rather than exported: what the AppImage bundles on top of the
     # lock, and what builds it, are pinned away from uv.lock on purpose --
     # see requirements/appimage.in. --universal so one file covers both arches.
@@ -190,6 +220,15 @@ lock-check:
 # of that list. Offline: `uv export` reads the lock, so this needs no network.
 export-check:
     python3 scripts/check_exports.py
+
+# Regenerate the shell package inventory consumed by install.sh. The committed
+# output keeps the runtime installer independent of a YAML parser.
+distro-packages: _tooling
+    uv run --no-sync python scripts/generate_distro_package_map.py
+
+# Fail if install.d/package_map.sh is behind its YAML source.
+distro-packages-check: _tooling
+    uv run --no-sync python scripts/generate_distro_package_map.py --check
 
 # The export pins names, versions and digests; this looks up the URL that serves
 # those bytes, so it needs PyPI. tests/test_flatpak_packaging.py checks the same

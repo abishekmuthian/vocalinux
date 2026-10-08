@@ -280,8 +280,8 @@ class TestTrayIndicator(unittest.TestCase):
             mock_dialog_instance.present_with_time.assert_called_once()
             mock_dialog_instance.navigate_to_page.assert_not_called()
 
-    def test_about_reuses_open_settings_dialog(self):
-        """About focuses the existing Settings window and switches to the About page."""
+    def test_update_available_reuses_open_settings_dialog(self):
+        """Update Available focuses the existing Settings window on the About page."""
         import vocalinux.ui.tray_indicator as tray_module
 
         mock_dialog_instance = MagicMock()
@@ -289,7 +289,7 @@ class TestTrayIndicator(unittest.TestCase):
 
         with patch.object(tray_module, "SettingsDialog", mock_dialog_class):
             self.tray_indicator._on_settings_clicked(None)
-            self.tray_indicator._on_about_clicked(None)
+            self.tray_indicator._on_update_available_clicked(None)
 
             mock_dialog_class.assert_called_once()
             mock_dialog_instance.navigate_to_page.assert_called_once_with("about")
@@ -312,13 +312,13 @@ class TestTrayIndicator(unittest.TestCase):
             second_dialog.show.assert_called_once()
             first_dialog.present_with_time.assert_not_called()
 
-    def test_about_dialog(self):
-        """Test About opens Settings focused on the About page."""
+    def test_update_available_opens_about_page(self):
+        """Test Update Available opens Settings focused on the About page."""
         with patch("vocalinux.ui.tray_indicator.SettingsDialog") as mock_dialog_class:
             mock_dialog_instance = MagicMock()
             mock_dialog_class.return_value = mock_dialog_instance
 
-            self.tray_indicator._on_about_clicked(None)
+            self.tray_indicator._on_update_available_clicked(None)
 
             mock_dialog_class.assert_called_once()
             kwargs = mock_dialog_class.call_args.kwargs
@@ -661,13 +661,13 @@ class TestTrayIndicator(unittest.TestCase):
                     self.tray_indicator.run()
                     mock_quit.assert_called_once()
 
-    def test_about_opens_settings_without_raising(self):
-        """Test About menu item opens settings even if dialog construction is mocked."""
+    def test_update_available_opens_settings_without_raising(self):
+        """Test Update Available opens settings even if dialog construction is mocked."""
         with patch("vocalinux.ui.tray_indicator.SettingsDialog") as mock_dialog_class:
             mock_dialog_instance = MagicMock()
             mock_dialog_class.return_value = mock_dialog_instance
 
-            self.tray_indicator._on_about_clicked(None)
+            self.tray_indicator._on_update_available_clicked(None)
 
             mock_dialog_instance.connect.assert_called()
             mock_dialog_instance.show.assert_called_once()
@@ -884,6 +884,184 @@ class TestTrayIndicator(unittest.TestCase):
             delattr(self.tray_indicator, "menu")
 
         self.tray_indicator._set_menu_item_enabled("Start Voice Typing", True)
+
+    def test_update_overlay_reads_config_and_forwards_state(self):
+        """_update_overlay re-reads config and drives the floating overlay."""
+        from vocalinux.ui.tray_indicator import TrayIndicator
+
+        mock_overlay = MagicMock()
+        mock_cm = MagicMock()
+        mock_cm.is_overlay_enabled.return_value = True
+        self.tray_indicator.overlay = mock_overlay
+        self.tray_indicator.config_manager = mock_cm
+
+        TrayIndicator._update_overlay(self.tray_indicator, self.RecognitionState.LISTENING)
+
+        mock_overlay.set_enabled.assert_called_once_with(True)
+        mock_overlay.on_recognition_state.assert_called_once_with(self.RecognitionState.LISTENING)
+
+    def test_update_overlay_noop_when_overlay_missing(self):
+        from vocalinux.ui.tray_indicator import TrayIndicator
+
+        self.tray_indicator.overlay = None
+        self.tray_indicator.config_manager = MagicMock()
+        # Must not raise
+        TrayIndicator._update_overlay(self.tray_indicator, self.RecognitionState.LISTENING)
+
+    def test_set_overlay_enabled_updates_config_and_live_overlay(self):
+        from vocalinux.ui.tray_indicator import TrayIndicator
+
+        mock_overlay = MagicMock()
+        mock_cm = MagicMock()
+        self.tray_indicator.overlay = mock_overlay
+        self.tray_indicator.config_manager = mock_cm
+        self.mock_speech_engine.state = self.RecognitionState.LISTENING
+
+        TrayIndicator.set_overlay_enabled(self.tray_indicator, False)
+
+        mock_cm.set_overlay_enabled.assert_called_once_with(False)
+        mock_overlay.set_enabled.assert_called_once_with(False)
+        mock_overlay.on_recognition_state.assert_called_once_with(self.RecognitionState.LISTENING)
+
+    def test_set_overlay_enabled_without_overlay_still_saves_config(self):
+        from vocalinux.ui.tray_indicator import TrayIndicator
+
+        mock_cm = MagicMock()
+        self.tray_indicator.overlay = None
+        self.tray_indicator.config_manager = mock_cm
+
+        TrayIndicator.set_overlay_enabled(self.tray_indicator, True)
+        mock_cm.set_overlay_enabled.assert_called_once_with(True)
+
+    def test_update_ui_forwards_state_to_overlay(self):
+        """_update_ui keeps the floating overlay in sync with tray icon state."""
+        self.tray_indicator.indicator = MagicMock()
+        self.tray_indicator.icon_names = {
+            "default": "off",
+            "active": "on",
+            "processing": "proc",
+        }
+        with patch.object(self.tray_indicator, "_set_menu_item_enabled"):
+            with patch.object(self.tray_indicator, "_update_overlay") as mock_overlay:
+                for state in (
+                    self.RecognitionState.IDLE,
+                    self.RecognitionState.LISTENING,
+                    self.RecognitionState.PROCESSING,
+                    self.RecognitionState.ERROR,
+                ):
+                    mock_overlay.reset_mock()
+                    # _update_ui prefers the engine's live state over the hint.
+                    self.mock_speech_engine.state = state
+                    self.tray_indicator._update_ui(state)
+                    mock_overlay.assert_called_once_with(state)
+
+    def test_settings_dialog_receives_overlay_enabled_callback(self):
+        """Settings dialog is wired with the live overlay toggle callback."""
+        import vocalinux.ui.tray_indicator as tray_module
+
+        mock_dialog_instance = MagicMock()
+        mock_dialog_class = MagicMock(return_value=mock_dialog_instance)
+
+        with patch.object(tray_module, "SettingsDialog", mock_dialog_class):
+            self.tray_indicator._on_settings_clicked(None)
+            kwargs = mock_dialog_class.call_args.kwargs
+            self.assertIn("overlay_enabled_callback", kwargs)
+            self.assertEqual(
+                kwargs["overlay_enabled_callback"],
+                self.tray_indicator.set_overlay_enabled,
+            )
+
+    def test_quit_destroys_overlay(self):
+        mock_overlay = MagicMock()
+        self.tray_indicator.overlay = mock_overlay
+        self.tray_indicator._suspend_handler = None
+        with patch.object(self.tray_indicator, "_cleanup_input_monitor"):
+            with patch("vocalinux.ui.tray_indicator.Gtk") as patched_gtk:
+                self.tray_indicator._quit()
+        mock_overlay.destroy.assert_called_once()
+        self.assertIsNone(self.tray_indicator.overlay)
+        patched_gtk.main_quit.assert_called_once()
+
+    # --- Recent Snippets history menu -------------------------------------
+
+    def test_truncate_label_collapses_and_truncates(self) -> None:
+        from vocalinux.ui.tray_indicator import TrayIndicator
+
+        self.assertEqual(TrayIndicator._truncate_label("  a   b\nc  "), "a b c")
+        long = "x" * 200
+        truncated = TrayIndicator._truncate_label(long)
+        self.assertTrue(truncated.endswith("…"))
+        self.assertEqual(len(truncated), 50)
+
+    def test_refresh_history_menu_populated(self) -> None:
+        from vocalinux.ui.transcription_history import TranscriptionHistory
+
+        history = TranscriptionHistory()
+        history.add("first snippet")
+        history.add("second snippet")
+        self.tray_indicator.transcription_history = history
+        self.tray_indicator._history_menu_item = MagicMock()
+
+        result = self.tray_indicator._refresh_history_menu()
+
+        self.assertFalse(result)
+        self.tray_indicator._history_menu_item.set_submenu.assert_called_once()
+
+    def test_refresh_history_menu_empty(self) -> None:
+        from vocalinux.ui.transcription_history import TranscriptionHistory
+
+        self.tray_indicator.transcription_history = TranscriptionHistory()
+        self.tray_indicator._history_menu_item = MagicMock()
+
+        result = self.tray_indicator._refresh_history_menu()
+
+        self.assertFalse(result)
+        self.tray_indicator._history_menu_item.set_submenu.assert_called_once()
+
+    def test_refresh_history_menu_noop_without_item(self) -> None:
+        self.tray_indicator.transcription_history = None
+        self.tray_indicator._history_menu_item = None
+
+        # Should return False and not raise.
+        self.assertFalse(self.tray_indicator._refresh_history_menu())
+
+    def test_on_history_item_clicked_copies_to_clipboard(self) -> None:
+        self.tray_indicator._on_history_item_clicked(MagicMock(), "some snippet")
+
+        clipboard = mock_gtk.Clipboard.get.return_value
+        clipboard.set_text.assert_called_once_with("some snippet", -1)
+        clipboard.store.assert_called_once()
+
+    def test_on_clear_history_clicked_clears(self) -> None:
+        from vocalinux.ui.transcription_history import TranscriptionHistory
+
+        history = TranscriptionHistory()
+        history.add("a")
+        history.add("b")
+        self.tray_indicator.transcription_history = history
+
+        self.tray_indicator._on_clear_history_clicked(MagicMock())
+
+        self.assertEqual(len(history), 0)
+
+    def test_construct_with_history_creates_submenu_and_wires_callback(self) -> None:
+        from vocalinux.ui.transcription_history import TranscriptionHistory
+        from vocalinux.ui.tray_indicator import TrayIndicator
+
+        history = TranscriptionHistory()
+        tray = TrayIndicator(
+            speech_engine=self.mock_speech_engine,
+            text_injector=self.mock_text_injector,
+            transcription_history=history,
+        )
+        tray.shortcut_manager = self.mock_ksm
+
+        # The submenu item is created during _init_indicator.
+        self.assertIsNotNone(tray._history_menu_item)
+        # Adding a snippet fires the change callback, which refreshes the menu
+        # (GLib.idle_add runs synchronously under the test mocks).
+        history.add("live snippet")
+        self.assertTrue(tray._history_menu_item.set_submenu.called)
 
 
 class TestTrayIndicatorFlatpakIcons(unittest.TestCase):

@@ -8,9 +8,12 @@ Key focus areas:
 """
 
 import base64
+import json
 import os
 import sys
+import threading
 import time
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -31,6 +34,7 @@ from vocalinux.utils.model_checksums import VERIFICATION_STAMP_NAME, ChecksumErr
 from vocalinux.utils.model_checksums import verify_model_file as verify_model_file_real
 from vocalinux.utils.parakeet_model_info import MODEL_FILES as PARAKEET_MODEL_FILES
 from vocalinux.utils.parakeet_model_info import manifest_key as parakeet_manifest_key
+from vocalinux.utils.parakeet_model_info import model_files as parakeet_model_files
 
 
 def _make_manager(engine="whisper_cpp", **kw):
@@ -327,6 +331,101 @@ class TestDownloadWhispercppModel:
 
         with patch.dict("sys.modules", {"requests": mock_requests}):
             with pytest.raises(RuntimeError, match="cancelled"):
+                manager._stream_model_download("https://example.com/model.bin", dest)
+
+        assert not os.path.exists(dest)
+
+    def test_stream_model_download_cancelled_while_connecting(self, tmp_path) -> None:
+        """Cancel must not wait out a blocked request open.
+
+        requests offers no way to abort a request stuck resolving, connecting,
+        or waiting on headers — exactly what an unreachable download server
+        does. The flag is only read once chunks flow, so Cancel used to ride
+        out the whole connect/read timeout (issue #679).
+        """
+        manager = _make_manager(engine="whisper_cpp")
+        dest = str(tmp_path / "never.bin")
+
+        mock_requests = MagicMock()
+        release_opener = threading.Event()
+
+        def blocked_get(*args, **kwargs) -> MagicMock:
+            release_opener.wait(60)  # a server that never answers
+            return MagicMock()
+
+        mock_requests.get.side_effect = blocked_get
+
+        def cancel_soon() -> None:
+            time.sleep(0.3)
+            manager._download_cancelled = True
+
+        with patch.dict("sys.modules", {"requests": mock_requests}):
+            threading.Thread(target=cancel_soon, daemon=True).start()
+            started = time.monotonic()
+            with pytest.raises(RuntimeError, match="cancelled"):
+                manager._stream_model_download("https://example.com/model.bin", dest)
+            assert time.monotonic() - started < 10
+
+        # The opener the cancel abandoned must be released and reaped, not left
+        # sleeping inside later tests.
+        release_opener.set()
+        for opener in manager._download_openers:
+            opener.join(timeout=5)
+        assert not any(t.is_alive() for t in manager._download_openers)
+
+        assert not os.path.exists(dest)
+
+    def test_stream_model_download_closes_late_response(self, tmp_path) -> None:
+        """A response landing after the cancel is closed, not left streaming."""
+        manager = _make_manager(engine="whisper_cpp")
+        dest = str(tmp_path / "late.bin")
+
+        mock_requests = MagicMock()
+        mock_response = MagicMock()
+        release_opener = threading.Event()
+
+        def slow_get(*args, **kwargs) -> MagicMock:
+            release_opener.wait(60)
+            return mock_response
+
+        mock_requests.get.side_effect = slow_get
+        manager._download_cancelled = True
+
+        with patch.dict("sys.modules", {"requests": mock_requests}):
+            with pytest.raises(RuntimeError, match="cancelled"):
+                manager._stream_model_download("https://example.com/model.bin", dest)
+            release_opener.set()
+            for opener in manager._download_openers:
+                opener.join(timeout=5)
+
+        mock_response.close.assert_called_once()
+        assert not os.path.exists(dest)
+
+    def test_stream_model_download_propagates_request_errors(self, tmp_path) -> None:
+        """A failed open re-raises the original error for callers to classify."""
+        manager = _make_manager(engine="whisper_cpp")
+        dest = str(tmp_path / "err.bin")
+
+        mock_requests = MagicMock()
+        mock_requests.get.side_effect = FakeRequestError("Connection refused")
+        mock_requests.exceptions.RequestException = FakeRequestError
+
+        with patch.dict("sys.modules", {"requests": mock_requests}):
+            with pytest.raises(FakeRequestError, match="Connection refused"):
+                manager._stream_model_download("https://example.com/model.bin", dest)
+
+        assert not os.path.exists(dest)
+
+    def test_stream_model_download_no_response(self, tmp_path) -> None:
+        """A helper that produced neither a response nor an error still fails."""
+        manager = _make_manager(engine="whisper_cpp")
+        dest = str(tmp_path / "none.bin")
+
+        mock_requests = MagicMock()
+        mock_requests.get.return_value = None
+
+        with patch.dict("sys.modules", {"requests": mock_requests}):
+            with pytest.raises(RuntimeError, match="no response"):
                 manager._stream_model_download("https://example.com/model.bin", dest)
 
         assert not os.path.exists(dest)
@@ -804,6 +903,85 @@ class TestParakeetDownloadVerifiesExistingFiles:
         assert encoder.read_bytes() == b"good-enough"
 
 
+class TestParakeetReleaseManifestRecovery:
+    """Invalid publisher metadata must leave a retryable, unloaded model."""
+
+    @pytest.mark.parametrize("cached", [False, True])
+    @pytest.mark.parametrize("invalid_manifest", ['{"files": []}', '{"files": [{}]}'])
+    def test_invalid_manifest_is_removed_and_retry_reuses_weights(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        skip_checksum: MagicMock,
+        cached: bool,
+        invalid_manifest: str,
+    ) -> None:
+        from vocalinux.utils import parakeet_model_info as parakeet
+
+        model_name = "orukeet-v0.1.0"
+        model_dir = tmp_path / model_name
+        model_dir.mkdir()
+        names = parakeet_model_files(model_name)
+        manifest_path = model_dir / "manifest.json"
+        records = []
+        for name in names[1:]:
+            expected = expected_for(parakeet_manifest_key(model_name, name))
+            assert expected is not None
+            records.append({"path": name, "sha256": expected.digest, "bytes": expected.size})
+            if cached:
+                (model_dir / name).write_bytes(b"verified model file")
+        if cached:
+            manifest_path.write_text(invalid_manifest, encoding="utf-8")
+
+        manager = _make_manager(engine="parakeet")
+        manager.model_size = model_name
+        manager._defer_download = cached
+        progress = MagicMock()
+        manager._download_progress_callback = progress
+        streamed = []
+        content = invalid_manifest
+
+        def stream(url: str, destination: str) -> None:
+            streamed.append(os.path.basename(destination))
+            with open(destination, "wb") as target:
+                target.write(
+                    content.encode()
+                    if destination.endswith("manifest.json.tmp")
+                    else b"verified model file"
+                )
+
+        mock_sherpa = MagicMock()
+        mock_requests = MagicMock()
+        mock_requests.exceptions.RequestException = FakeRequestError
+        monkeypatch.setitem(sys.modules, "sherpa_onnx", mock_sherpa)
+        monkeypatch.setitem(sys.modules, "requests", mock_requests)
+        monkeypatch.setattr(parakeet, "get_model_path", lambda _: str(model_dir))
+        monkeypatch.setattr(manager, "_stream_model_download", stream)
+
+        if cached:
+            manager._init_parakeet()
+        else:
+            with pytest.raises(ChecksumError):
+                manager._init_parakeet()
+            assert manager.state == RecognitionState.ERROR
+        assert not manager._model_initialized
+        mock_sherpa.OfflineRecognizer.from_transducer.assert_not_called()
+        assert not manifest_path.exists()
+        assert not parakeet.is_model_downloaded(model_name)
+        assert manager._download_progress_callback is progress
+        assert all(call.args[2] != "Complete!" for call in progress.call_args_list)
+        assert all((model_dir / name).read_bytes() == b"verified model file" for name in names[1:])
+
+        content = json.dumps({"files": records})
+        manager._defer_download = False
+        streamed.clear()
+        manager._init_parakeet()
+        assert manager._model_initialized
+        assert parakeet.is_model_downloaded(model_name)
+        assert streamed == ["manifest.json.tmp"]
+        assert progress.call_args.args == (1.0, 0, "Complete!")
+
+
 class TestFasterWhisperRejectsAnUnverifiedModelOnDisk:
     """Wiring test: the hash has to happen where the model is picked up."""
 
@@ -1114,19 +1292,19 @@ class TestAudioReconnection:
             patch.dict("sys.modules", {"pyaudio": mock_pyaudio_mod}),
             patch("time.sleep"),
             patch(
-                "vocalinux.speech_recognition.recognition_manager._resolve_device_by_name",
+                "vocalinux.audio.capture._resolve_device_by_name",
                 return_value=None,
             ) as mock_resolve_name,
             patch(
-                "vocalinux.speech_recognition.recognition_manager._resolve_valid_input_device",
+                "vocalinux.audio.capture._resolve_valid_input_device",
                 return_value=1,
             ) as mock_resolve_default,
             patch(
-                "vocalinux.speech_recognition.recognition_manager._get_supported_channels",
+                "vocalinux.audio.capture._get_supported_channels",
                 return_value=1,
             ),
             patch(
-                "vocalinux.speech_recognition.recognition_manager._get_supported_sample_rate",
+                "vocalinux.audio.capture._get_supported_sample_rate",
                 return_value=16000,
             ),
         ):
@@ -1150,15 +1328,15 @@ class TestAudioReconnection:
             patch.dict("sys.modules", {"pyaudio": mock_pyaudio_mod}),
             patch("time.sleep"),
             patch(
-                "vocalinux.speech_recognition.recognition_manager._resolve_device_by_name",
+                "vocalinux.audio.capture._resolve_device_by_name",
                 return_value=None,
             ),
             patch(
-                "vocalinux.speech_recognition.recognition_manager._resolve_valid_input_device",
+                "vocalinux.audio.capture._resolve_valid_input_device",
                 return_value=None,
             ),
             patch(
-                "vocalinux.speech_recognition.recognition_manager._open_capture_stream",
+                "vocalinux.audio.capture._open_capture_stream",
                 return_value=(1, 16000, mock_stream),
             ) as mock_open,
         ):
@@ -1239,7 +1417,7 @@ class TestAudioReconnection:
             patch.dict("sys.modules", {"pyaudio": mock_pyaudio_mod}),
             patch("time.sleep"),
             patch(
-                "vocalinux.speech_recognition.recognition_manager._open_capture_stream",
+                "vocalinux.audio.capture._open_capture_stream",
                 return_value=(1, 16000, None),
             ),
         ):

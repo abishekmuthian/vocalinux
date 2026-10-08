@@ -10,7 +10,8 @@ import os
 import signal
 import threading
 import time
-from typing import Callable, Optional
+from functools import partial
+from typing import Any, Callable, Optional, Sequence, cast
 
 import gi
 
@@ -37,17 +38,31 @@ from gi.repository import GdkPixbuf, Gio, GLib, GObject, Gtk
 # Import local modules - Use protocols to avoid circular imports
 from ..auto_pause_monitor import DEFAULT_POLL_INTERVAL_SECONDS, AutoPauseMonitor
 from ..common_types import RecognitionState, SpeechRecognitionManagerProtocol, TextInjectorProtocol
+from ..dbus_service import VocalinuxDBusService
+from ..gateway_embed import GatewayStatus, get_gateway_embed_manager
 from ..model_keepalive import DEFAULT_IDLE_TIMEOUT_SECONDS, ModelKeepAlive
+from ..speech_recognition.diarization import (
+    TranscriptBlock,
+    ffmpeg_available,
+    transcribe_audio_file,
+)
 from ..suspend_handler import SuspendHandler
 from ..utils.host_process import host_env
 from ..utils.resource_manager import ResourceManager
 from ..utils.update_checker import ReleaseInfo
 from ..utils.update_monitor import UpdateMonitor
+from ..utils.whispercpp_model_info import TDRZ_MODEL, WHISPERCPP_MODEL_INFO, is_model_downloaded
 from . import notifications
 from .config_manager import get_shared_config_manager
-from .keyboard_backends import DEFAULT_SHORTCUT, DEFAULT_SHORTCUT_MODE
+from .keyboard_backends import (
+    DEFAULT_SHORTCUT,
+    DEFAULT_SHORTCUT_MODE,
+    SHORTCUT_MODES,
+    shortcut_gestures_collide,
+)
 from .keyboard_shortcuts import KeyboardShortcutManager
-from .settings_dialog import SettingsDialog, recommended_model_for_engine
+from .settings_dialog import ModelDownloadDialog, SettingsDialog, recommended_model_for_engine
+from .transcription_history import DEFAULT_MAX_ITEMS, TranscriptionHistory
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +114,9 @@ def _themed_icon_names() -> dict:
     }
 
 
+# Maximum characters shown for a history snippet label before truncation.
+_HISTORY_LABEL_MAX_CHARS = 50
+
 # /dev/input settle-detection tuning (used after resume)
 _INPUT_SETTLE_SECONDS = 2
 _INPUT_MONITOR_CAP_SECONDS = 10
@@ -113,24 +131,63 @@ class TrayIndicator:
     the speech recognition process.
     """
 
+    # Tests build TrayIndicator stubs with __new__ that skip __init__; keep a
+    # class-level default so teardown paths like _quit() still find the list.
+    _language_shortcut_managers: list = []
+
+    #: Same for the push-to-talk owner slot: a __new__-built stub must answer
+    #: "no binding owns the live session" instead of raising on release paths.
+    _ptt_owner: Optional["KeyboardShortcutManager"] = None
+
+    #: Serializes push-to-talk press/release handling. Press and release
+    #: callbacks run on separate backend threads, so a release landing while
+    #: start_recognition is still running must not be lost (#805).
+    _ptt_lock = threading.RLock()
+
     def __init__(
         self,
         speech_engine: SpeechRecognitionManagerProtocol,
         text_injector: TextInjectorProtocol,
-    ):
+        transcription_history: Optional[TranscriptionHistory] = None,
+        on_quit: Optional[Callable[[], None]] = None,
+        dictation_pad: Optional[Any] = None,
+    ) -> None:
         """
         Initialize the system tray indicator.
 
         Args:
             speech_engine: The speech recognition manager instance
             text_injector: The text injector instance
+            transcription_history: Optional in-memory store of recent dictation
+                snippets. When provided, a "Recent Snippets" submenu is shown.
+            on_quit: Optional hook run during _quit before the text injector
+                is stopped (drains the post-processing worker so a queued or
+                in-flight segment cannot inject into a torn-down app)
+            dictation_pad: Optional in-app Dictation Pad window the tray menu
+                can open (the Wayland-safe dictation fallback, #726)
         """
         self.speech_engine = speech_engine
         self.text_injector = text_injector
+        self.transcription_history = transcription_history
+        self._on_quit = on_quit
+        self.dictation_pad = dictation_pad
         # Shared with main() and the settings dialog: separate instances would
         # overwrite each other's saves with stale in-memory copies.
         self.config_manager = get_shared_config_manager()
-        self._syncing_autostart_menu = False
+        # Set once by _on_dbus_registration_failed and never cleared: the
+        # service does not retry, so every later reconfigure (mode change,
+        # settings toggle, resume) must keep honoring the fallback rather
+        # than reapplying a disable_internal_hotkey setting D-Bus cannot serve.
+        self._external_activation_unavailable = False
+        self._history_menu_item = None
+
+        # Refresh the history submenu whenever the history changes. The change
+        # callback fires on the recognition thread, so marshal onto the GTK
+        # main thread before touching widgets.
+        if self.transcription_history is not None:
+            self.transcription_history.set_change_callback(
+                lambda: GLib.idle_add(self._refresh_history_menu)
+            )
 
         # Get configured shortcut and mode from config
         shortcut = self.config_manager.get_str("shortcuts", "toggle_recognition", DEFAULT_SHORTCUT)
@@ -138,6 +195,18 @@ class TrayIndicator:
 
         # Initialize keyboard shortcut manager with configured shortcut and mode
         self.shortcut_manager = KeyboardShortcutManager(shortcut=shortcut, mode=mode)
+        # One listener per bound language shortcut (#805); rebuilt by
+        # _setup_language_shortcuts alongside the main one.
+        self._language_shortcut_managers: list[KeyboardShortcutManager] = []
+        # A settings edit landed while a dictation session was live; the
+        # listener rebuild is deferred to the next IDLE transition (#805).
+        self._language_shortcuts_refresh_pending = False
+        # The binding whose press started the live push-to-talk session, so an
+        # unrelated key's release cannot end it (#805).
+        self._ptt_owner: Optional[KeyboardShortcutManager] = None
+        # Serializes the press/release pair across backend threads, so a
+        # release landing while start_recognition runs cannot be lost.
+        self._ptt_lock = threading.RLock()
 
         # Ensure icon directory exists
         os.makedirs(ICON_DIR, exist_ok=True)
@@ -174,6 +243,12 @@ class TrayIndicator:
         self._model_download_active = False
         if hasattr(self.speech_engine, "set_model_missing_handler"):
             self.speech_engine.set_model_missing_handler(self._offer_recommended_model)
+
+        # Floating on-screen indicator (glow while listening); gated by config.
+        # Lazy import keeps tray import light for tests that mock gi.
+        from .dictation_overlay import DictationOverlay
+
+        self.overlay = DictationOverlay(enabled=self.config_manager.is_overlay_enabled())
 
         # Initialize the icon files and validate resources
         self._init_icons()
@@ -220,8 +295,63 @@ class TrayIndicator:
         # Set up keyboard shortcuts with mode support
         self._setup_keyboard_shortcuts()
 
+        # Register the session-bus service so external triggers (e.g. a KDE
+        # Plasma global shortcut running `vocalinux --toggle`) can control this
+        # running instance. Handlers marshal onto the GTK main thread.
+        self._dbus_service = VocalinuxDBusService(
+            on_toggle=self._toggle_recognition,
+            on_start=self._external_start,
+            on_stop=self._external_stop,
+            on_registration_failed=self._on_dbus_registration_failed,
+        )
+
+    def _external_activation_active(self) -> bool:
+        """Whether the internal listener should stay off right now.
+
+        True only when the saved setting asks for it *and* the D-Bus service
+        has not already failed to register this run. The service does not
+        retry, so once it has failed, this stays False for the rest of the
+        process regardless of the saved setting — every later reconfigure
+        (mode change, settings toggle, resume) must keep using the fallback
+        instead of re-disabling the only working activation path.
+        """
+        if self._external_activation_unavailable:
+            return False
+        return self.config_manager.get_bool("shortcuts", "disable_internal_hotkey", False)
+
+    def _on_dbus_registration_failed(self) -> None:
+        """Fall back to the internal listener if external activation cannot work.
+
+        Runs when the D-Bus service could not claim its bus name or register
+        its object (no session bus, name already owned, etc.). If the internal
+        evdev/pynput listener is also disabled, the user would otherwise be
+        left with no way to start or stop dictation at all.
+        """
+        if not self.config_manager.get_bool("shortcuts", "disable_internal_hotkey", False):
+            return
+        logger.error(
+            "D-Bus activation unavailable and the internal listener is disabled; "
+            "falling back to the internal listener"
+        )
+        notifications.notify(
+            "External activation unavailable",
+            "The D-Bus service could not start, so Vocalinux is using the "
+            "internal keyboard shortcut instead. Check Settings -> Shortcuts.",
+            "dialog-warning",
+        )
+        self._external_activation_unavailable = True
+        self._setup_keyboard_shortcuts()
+
     def _setup_keyboard_shortcuts(self):
         """Set up keyboard shortcuts based on configured mode."""
+        # Reconfiguring (e.g. live-toggling external activation) tears down the
+        # release callback below. A push-to-talk session held at that moment
+        # would then never see its release, leaving recognition and the
+        # microphone running with no way back except another control surface.
+        if self.speech_engine.state != RecognitionState.IDLE:
+            logger.info("Stopping active recognition before reconfiguring shortcuts")
+            self._stop_recognition()
+
         # Stop existing shortcut manager if running
         if self.shortcut_manager.active:
             logger.info("Stopping existing shortcut manager before reconfiguration")
@@ -231,6 +361,16 @@ class TrayIndicator:
         self.shortcut_manager.register_toggle_callback(None)
         self.shortcut_manager.register_press_callback(None)
         self.shortcut_manager.register_release_callback(None)
+
+        # External-activation mode: skip the internal evdev/pynput listener
+        # entirely so no /dev/input access is required. Activation then comes
+        # in over D-Bus (see VocalinuxDBusService).
+        if self._external_activation_active():
+            logger.info("Internal hotkey listener disabled (external activation via D-Bus)")
+            # The whole internal listener family is off; per-language
+            # listeners must not keep firing either.
+            self._stop_language_shortcut_managers()
+            return
 
         # Get configured mode from config
         mode = self.config_manager.get_str("shortcuts", "mode", DEFAULT_SHORTCUT_MODE)
@@ -242,10 +382,118 @@ class TrayIndicator:
         elif mode == "push_to_talk":
             # Register press/release callbacks for push-to-talk mode
             self.shortcut_manager.register_press_callback(self._start_recognition)
-            self.shortcut_manager.register_release_callback(self._stop_recognition)
+            self.shortcut_manager.register_release_callback(self._release_main_push_to_talk)
 
         # Start the keyboard shortcut manager
         self.shortcut_manager.start()
+
+        self._setup_language_shortcuts()
+
+    def _setup_language_shortcuts(self) -> None:
+        """(Re)build a listener per configured language shortcut (#805).
+
+        Each entry gets its own KeyboardShortcutManager; on evdev the
+        backends all share one process-wide device layer, so parallel
+        listeners observe the same keyboards without competing grabs. A
+        binding whose gesture collides with the main shortcut or an earlier
+        language binding is skipped: the same gesture cannot fire both.
+        """
+        # Same stop-first protection as _setup_keyboard_shortcuts: rebuilding
+        # below removes the release callback a held push-to-talk key needs to
+        # end its session, so the hold must be ended before it can be lost.
+        if self.speech_engine.state != RecognitionState.IDLE:
+            logger.info("Stopping active recognition before rebuilding language shortcuts")
+            self._stop_recognition()
+
+        self._stop_language_shortcut_managers()
+
+        mode = self.config_manager.get_str("shortcuts", "mode", DEFAULT_SHORTCUT_MODE)
+        if mode not in SHORTCUT_MODES:
+            # A hand-edited mode must not take down the whole shortcut setup
+            # via a backend constructor's ValueError.
+            logger.warning(f"Unknown shortcut mode {mode!r} for language shortcuts")
+            mode = DEFAULT_SHORTCUT_MODE
+        main_shortcut = (
+            self.config_manager.get_str("shortcuts", "toggle_recognition", DEFAULT_SHORTCUT)
+            .strip()
+            .lower()
+        )
+
+        # Collisions are judged on the gestures the backends match, not the
+        # strings: "ctrl+alt+r" and "alt+ctrl+r" name the same key press, and
+        # "left_ctrl+left_ctrl" fires inside "ctrl+ctrl"'s key set.
+        bound = [main_shortcut]
+        for entry in self.config_manager.get_language_shortcuts():
+            shortcut = entry["shortcut"]
+            language = entry["language"]
+            if any(shortcut_gestures_collide(shortcut, other) for other in bound):
+                logger.warning(
+                    f"Skipping language shortcut {shortcut!r} for {language}: "
+                    "it shares its gesture with another binding"
+                )
+                continue
+            bound.append(shortcut)
+
+            try:
+                manager = KeyboardShortcutManager(shortcut=shortcut, mode=mode)
+            except ValueError as exc:
+                logger.warning(f"Skipping language shortcut {shortcut!r} for {language}: {exc}")
+                continue
+            if mode == "toggle":
+                manager.register_toggle_callback(
+                    partial(self._toggle_recognition_in_language, language)
+                )
+            else:
+                manager.register_press_callback(
+                    partial(self._start_recognition_in_language, language, manager)
+                )
+                manager.register_release_callback(
+                    partial(self._release_language_push_to_talk, manager)
+                )
+            manager.start()
+            self._language_shortcut_managers.append(manager)
+            logger.info(f"Language shortcut {shortcut} -> {language} armed ({mode} mode)")
+
+    def _apply_history_settings(self) -> None:
+        """Push the saved history preferences onto the live store (#805).
+
+        Toggling history off must stop retention immediately — not after a
+        restart — and the snippets-keep limit applies to what's already held.
+        """
+        if self.transcription_history is None:
+            return
+        enabled = self.config_manager.get_bool("history", "enabled", True)
+        max_items = self.config_manager.get_int("history", "max_items", DEFAULT_MAX_ITEMS)
+        persist = self.config_manager.get_bool("history", "persist", False)
+        self.transcription_history.set_max_items(max_items)
+        self.transcription_history.set_enabled(enabled)
+        self.transcription_history.set_persist(persist)
+
+    def _stop_language_shortcut_managers(self) -> None:
+        """Stop every per-language listener and drop the managers."""
+        for manager in self._language_shortcut_managers:
+            try:
+                manager.stop()
+            except Exception:
+                logger.exception("Failed to stop a language shortcut manager")
+        self._language_shortcut_managers = []
+
+    def refresh_language_shortcuts(self) -> None:
+        """Rebuild the per-language listeners after a settings change (#805).
+
+        While a dictation session is live the rebuild is deferred to the
+        next IDLE transition instead: rebuilding stops recognition first,
+        and a keystroke-level settings edit must never cut an utterance off.
+        """
+        if self._external_activation_active():
+            # The internal listener family is off; a binding edit must not
+            # arm language listeners behind the external-activation setting.
+            self._stop_language_shortcut_managers()
+            return
+        if self.speech_engine.state != RecognitionState.IDLE:
+            self._language_shortcuts_refresh_pending = True
+            return
+        self._setup_language_shortcuts()
 
     def _init_icons(self):
         """Initialize the icon files for the tray indicator."""
@@ -327,16 +575,25 @@ class TrayIndicator:
         # Add menu items
         self._add_menu_item("Start Voice Typing", self._on_start_clicked)
         self._add_menu_item("Stop Voice Typing", self._on_stop_clicked)
+        self._add_menu_item("Transcribe Audio File\u2026", self._on_transcribe_file_clicked)
         self._add_menu_separator()
 
-        self._autostart_menu_item = self._add_menu_checkbox(
-            "Start on Login", self._on_autostart_toggled
-        )
-        self._update_autostart_checkbox()
+        # Recent snippets submenu (only when history is enabled)
+        if self.transcription_history is not None and self.transcription_history.enabled:
+            self._history_menu_item = Gtk.MenuItem.new_with_label("Recent Snippets")
+            self.menu.append(self._history_menu_item)
+            self._refresh_history_menu()
+            self._add_menu_separator()
 
-        self._add_menu_separator()
+        if self.dictation_pad is not None:
+            self._add_menu_item("Dictation Pad", self._on_dictation_pad_clicked)
         self._add_menu_item("Settings", self._on_settings_clicked)
         self._add_menu_item("View Logs", self._on_logs_clicked)
+        self._gateway_stop_menu_item = self._add_menu_item(
+            "Stop local Gateway", self._on_stop_local_gateway_clicked
+        )
+        self._gateway_stop_menu_item.set_no_show_all(True)
+        self._gateway_stop_menu_item.hide()
         self._add_menu_separator()
         # Hidden until a background check finds a newer release.
         self._update_menu_item = self._add_menu_item(
@@ -344,7 +601,6 @@ class TrayIndicator:
         )
         self._update_menu_item.set_no_show_all(True)
         self._update_menu_item.hide()
-        self._add_menu_item("About", self._on_about_clicked)
         self._add_menu_item("Quit", self._on_quit_clicked)
 
         # Set the indicator menu
@@ -357,6 +613,12 @@ class TrayIndicator:
             self._update_menu_item.hide()
         else:
             self._show_update_menu_item(self._pending_update)
+        self._gateway_stop_menu_item.hide()
+        self._gateway_manager = get_gateway_embed_manager()
+        self._gateway_manager.add_listener(self._on_gateway_status_for_tray)
+        # Runtime detect + leftover compose probe (Quit does not stop compose).
+        self._gateway_manager.begin_runtime_detection()
+        self._sync_gateway_stop_menu(self._gateway_manager.status)
 
         # Update the UI based on the initial state
         self._update_ui(RecognitionState.IDLE)
@@ -441,22 +703,105 @@ class TrayIndicator:
         dialog.show()
         return False
 
-    def _toggle_recognition(self):
+    def _toggle_recognition(self) -> None:
         """Toggle the recognition state between IDLE and LISTENING."""
-        if self.speech_engine.state == RecognitionState.IDLE:
-            self.speech_engine.start_recognition()
-        else:
-            self.speech_engine.stop_recognition()
+        with self._ptt_lock:
+            self._ptt_owner = None
+            if self.speech_engine.state == RecognitionState.IDLE:
+                self.speech_engine.start_recognition()
+            else:
+                self.speech_engine.stop_recognition()
 
-    def _start_recognition(self):
+    def _start_recognition(self) -> None:
         """Start voice recognition (for push-to-talk mode)."""
-        if self.speech_engine.state == RecognitionState.IDLE:
-            self.speech_engine.start_recognition(mode="push_to_talk")
+        self._push_to_talk_press(
+            self.shortcut_manager,
+            lambda: self.speech_engine.start_recognition(mode="push_to_talk"),
+        )
 
-    def _stop_recognition(self):
+    def _push_to_talk_press(
+        self, manager: Optional[KeyboardShortcutManager], start: Callable[[], bool]
+    ) -> None:
+        """Push-to-talk press shared by the main and per-language bindings (#805).
+
+        The release runs on another backend thread and used to be dropped when
+        it landed between LISTENING and the owner assignment, leaving
+        dictation running with the key already up. Holding the lock through
+        the whole start makes the release wait instead: it then finds the
+        owner and ends the session normally.
+        """
+        with self._ptt_lock:
+            if self.speech_engine.state == RecognitionState.IDLE and start():
+                self._ptt_owner = manager
+
+    def _push_to_talk_release(self, manager: KeyboardShortcutManager) -> None:
+        """Push-to-talk release: end the session only when this binding owns it."""
+        with self._ptt_lock:
+            if self._ptt_owner is manager:
+                self._stop_recognition()
+
+    def _release_main_push_to_talk(self) -> None:
+        """End a push-to-talk session only when the main binding started it (#805)."""
+        self._push_to_talk_release(self.shortcut_manager)
+
+    def _release_language_push_to_talk(self, manager: KeyboardShortcutManager) -> None:
+        """End a push-to-talk session only when this binding started it (#805).
+
+        Sharing one stop callback across listeners let an unrelated binding's
+        release end a session it never started.
+        """
+        self._push_to_talk_release(manager)
+
+    def _toggle_recognition_in_language(self, language: str) -> None:
+        """Toggle-style trigger for a per-language shortcut (#805).
+
+        While idle it starts a one-shot dictation in ``language``; while
+        dictating it stops, matching the main toggle's behaviour regardless
+        of which language the current utterance is in.
+        """
+        with self._ptt_lock:
+            self._ptt_owner = None
+            if self.speech_engine.state == RecognitionState.IDLE:
+                self.speech_engine.start_recognition_with_language(language)
+            else:
+                self.speech_engine.stop_recognition()
+
+    def _start_recognition_in_language(
+        self, language: str, manager: Optional[KeyboardShortcutManager] = None
+    ) -> None:
+        """Push-to-talk start for a per-language shortcut (#805)."""
+        self._push_to_talk_press(
+            manager,
+            lambda: self.speech_engine.start_recognition_with_language(
+                language, mode="push_to_talk"
+            ),
+        )
+
+    def _external_start(self) -> None:
+        """Start recognition for an external (D-Bus) trigger.
+
+        Uses normal start semantics — not push-to-talk — so a single
+        `vocalinux --start` transcribes immediately/with silence detection
+        rather than deferring until a Stop.
+        """
+        with self._ptt_lock:
+            self._ptt_owner = None
+            if self.speech_engine.state == RecognitionState.IDLE:
+                self.speech_engine.start_recognition()
+
+    def _external_stop(self) -> None:
+        """Stop recognition for an external (D-Bus) trigger."""
+        with self._ptt_lock:
+            self._ptt_owner = None
+            if self.speech_engine.state != RecognitionState.IDLE:
+                self.speech_engine.stop_recognition()
+
+    def _stop_recognition(self) -> None:
         """Stop voice recognition (for push-to-talk mode)."""
-        if self.speech_engine.state != RecognitionState.IDLE:
-            self.speech_engine.stop_recognition()
+        with self._ptt_lock:
+            self._ptt_owner = None
+            if self.speech_engine.state != RecognitionState.IDLE:
+                self.speech_engine.stop_recognition()
 
     def _add_menu_item(self, label: str, callback: Callable):
         """
@@ -475,56 +820,6 @@ class TrayIndicator:
         """Add a separator to the indicator menu."""
         separator = Gtk.SeparatorMenuItem()
         self.menu.append(separator)
-
-    def _add_menu_checkbox(self, label: str, callback: Callable) -> Gtk.CheckMenuItem:
-        """
-        Add a checkbox menu item to the indicator menu.
-
-        Args:
-            label: The label for the menu item
-            callback: The callback function to call when the item is toggled
-
-        Returns:
-            The checkbox menu item
-        """
-        item = Gtk.CheckMenuItem.new_with_label(label)
-        item.connect("toggled", callback)
-        self.menu.append(item)
-        return item
-
-    def _update_autostart_checkbox(self):
-        """Update the autostart checkbox state based on current config."""
-        from . import autostart_manager
-
-        autostart_enabled = autostart_manager.is_autostart_enabled()
-        config_enabled = self.config_manager.get_bool("general", "autostart", False)
-        if config_enabled != autostart_enabled:
-            self.config_manager.set("general", "autostart", autostart_enabled)
-            self.config_manager.save_settings()
-
-        self._syncing_autostart_menu = True
-        self._autostart_menu_item.set_active(autostart_enabled)
-        self._syncing_autostart_menu = False
-
-    def _on_autostart_toggled(self, widget):
-        """Handle toggle of the Start on Login menu item."""
-        if self._syncing_autostart_menu:
-            return
-
-        enabled = widget.get_active()
-        logger.info(f"Autostart toggled: {enabled}")
-
-        from . import autostart_manager
-
-        if autostart_manager.set_autostart(enabled):
-            self.config_manager.set("general", "autostart", enabled)
-            self.config_manager.save_settings()
-            status = "enabled" if enabled else "disabled"
-            logger.info(f"Autostart {status}")
-        else:
-            self._syncing_autostart_menu = True
-            widget.set_active(not enabled)
-            self._syncing_autostart_menu = False
 
     def _on_recognition_state_changed(self, state: RecognitionState):
         """
@@ -636,7 +931,7 @@ class TrayIndicator:
         """Download the offered model, then report how it went."""
         last_notified = 0.0
 
-        def on_progress(fraction, speed_mbps, status):
+        def on_progress(fraction: float, speed_mbps: float, status: str) -> None:
             nonlocal last_notified
             now = time.monotonic()
             if now - last_notified < _DOWNLOAD_NOTIFY_INTERVAL_SECONDS:
@@ -696,6 +991,152 @@ class TrayIndicator:
             self.speech_engine.end_download()
             self._model_download_active = False
 
+    def _on_transcribe_file_clicked(self, widget: Gtk.Widget) -> None:
+        """Pick an audio file and transcribe it with speaker attribution."""
+        chooser = Gtk.FileChooserDialog(
+            title="Transcribe Audio File",
+            transient_for=None,
+            action=Gtk.FileChooserAction.OPEN,
+        )
+        chooser.add_button("_Cancel", Gtk.ResponseType.CANCEL)
+        chooser.add_button("_Open", Gtk.ResponseType.OK)
+
+        # Non-WAV formats are decoded through ffmpeg; without it only the
+        # patterns the built-in WAV loader accepts are offered, so the picker
+        # never advertises a format that cannot be transcribed.
+        audio_filter = Gtk.FileFilter()
+        if ffmpeg_available():
+            audio_filter.set_name("Audio files")
+            for pattern in ("*.wav", "*.mp3", "*.ogg", "*.flac", "*.m4a", "*.opus"):
+                audio_filter.add_pattern(pattern)
+        else:
+            audio_filter.set_name("WAV audio (install ffmpeg for MP3/OGG/FLAC/M4A/Opus)")
+            audio_filter.add_pattern("*.wav")
+        chooser.add_filter(audio_filter)
+
+        try:
+            if chooser.run() == Gtk.ResponseType.OK:
+                path = chooser.get_filename()
+            else:
+                path = None
+        finally:
+            chooser.destroy()
+
+        if path:
+            self._start_file_transcription(path)
+
+    def _start_file_transcription(self, path: str) -> None:
+        """Transcribe ``path`` on a worker, downloading TinyDiarize if needed."""
+        if not is_model_downloaded(TDRZ_MODEL):
+            self._offer_tdrz_download(path)
+            return
+
+        basename = os.path.basename(path)
+        progress = notifications.notify(
+            "Transcribing audio file",
+            f"{basename} — this can take a while on long files...",
+            "audio-x-generic",
+        )
+
+        def run() -> None:
+            try:
+                blocks = transcribe_audio_file(path)
+            except Exception as error:
+                logger.error("File transcription failed for %s: %s", path, error, exc_info=True)
+                _idle_once(notifications.close, progress)
+                _idle_once(
+                    notifications.notify,
+                    "Transcription failed",
+                    f"{basename}: {error}",
+                    "dialog-error",
+                )
+                return
+            _idle_once(notifications.close, progress)
+            _idle_once(self._show_transcript, basename, blocks)
+
+        threading.Thread(target=run, daemon=True, name="file-transcription").start()
+
+    def _show_transcript(self, basename: str, blocks: Sequence[TranscriptBlock]) -> None:
+        """Open the transcript dialog for the finished blocks."""
+        from .transcript_dialog import TranscriptDialog
+
+        dialog = TranscriptDialog(None, basename)
+        dialog.set_transcript(blocks)
+        dialog.show_all()
+
+    def _offer_tdrz_download(self, path: str) -> None:
+        """Ask to fetch TinyDiarize, then continue into transcription."""
+        info = WHISPERCPP_MODEL_INFO[TDRZ_MODEL]
+        prompt = Gtk.MessageDialog(
+            transient_for=None,
+            flags=Gtk.DialogFlags.MODAL,
+            message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.NONE,
+            text="Transcribing audio files needs the TinyDiarize model",
+        )
+        prompt.format_secondary_text(
+            f"Download it now? (~{info['size_mb']} MB, one-time). "
+            "It is a whisper.cpp model that marks speaker turns; it never "
+            "becomes your dictation model."
+        )
+        prompt.add_button("_Cancel", Gtk.ResponseType.CANCEL)
+        prompt.add_button("_Download", Gtk.ResponseType.OK)
+
+        try:
+            accepted = prompt.run() == Gtk.ResponseType.OK
+        finally:
+            prompt.destroy()
+
+        if not accepted:
+            return
+        if not self.speech_engine.try_begin_download():
+            notifications.notify(
+                "Download already in progress",
+                "Another speech model is being downloaded. Wait for it to finish, "
+                "then try again.",
+                "dialog-information",
+            )
+            return
+
+        dialog = ModelDownloadDialog(
+            None, TDRZ_MODEL, cast(int, info["size_mb"]), engine="whisper_cpp"
+        )
+        # The dialog's post-complete OK button emits a response but destroys
+        # nothing on its own.
+        dialog.connect("response", lambda *_args: dialog.destroy())
+
+        def run() -> None:
+            def on_progress(fraction: float, speed_mbps: float, status: str) -> None:
+                GLib.idle_add(dialog.update_progress, fraction, speed_mbps, status)
+
+            def check_cancelled() -> bool:
+                if dialog.cancelled:
+                    self.speech_engine.cancel_download()
+                return not dialog.cancelled
+
+            cancel_check_id = GLib.timeout_add(100, check_cancelled)
+            try:
+                self.speech_engine.set_download_progress_callback(on_progress)
+                self.speech_engine.download_whispercpp_model(TDRZ_MODEL)
+            except Exception as error:
+                logger.error("TinyDiarize download failed: %s", error, exc_info=True)
+                message = (
+                    "Download cancelled" if "cancelled" in str(error).lower() else str(error)[:100]
+                )
+                GLib.idle_add(dialog.set_complete, False, message)
+                return
+            finally:
+                GLib.source_remove(cancel_check_id)
+                self.speech_engine.set_download_progress_callback(None)
+                self.speech_engine.end_download()
+
+            GLib.idle_add(dialog.set_complete, True, "")
+            # The dialog shows its own completion; starting the transcription
+            # as soon as the model lands keeps the flow to a single click.
+            _idle_once(self._start_file_transcription, path)
+
+        threading.Thread(target=run, daemon=True, name="tdrz-download").start()
+
     def _set_indicator_icon(self, icon_key: str, description: str) -> None:
         """Apply a tray icon, forcing a host redraw when cycling reused paths.
 
@@ -723,12 +1164,19 @@ class TrayIndicator:
                 state wins: GLib.idle_add can deliver a captured PROCESSING
                 argument after stop already went IDLE (#739).
         """
-        if not hasattr(self, "indicator"):
-            return False
-
         engine_state = getattr(self.speech_engine, "state", None)
         if isinstance(engine_state, RecognitionState):
             state = engine_state
+
+        if state == RecognitionState.IDLE and getattr(
+            self, "_language_shortcuts_refresh_pending", False
+        ):
+            # The session the listener rebuild was deferred for has ended.
+            self._language_shortcuts_refresh_pending = False
+            self.refresh_language_shortcuts()
+
+        if not hasattr(self, "indicator"):
+            return False
 
         if state == RecognitionState.IDLE:
             self._set_indicator_icon(self._icon_keys["default"], "Microphone off")
@@ -747,7 +1195,27 @@ class TrayIndicator:
             self._set_menu_item_enabled("Start Voice Typing", True)
             self._set_menu_item_enabled("Stop Voice Typing", False)
 
+        # Keep floating overlay in sync with tray (same RecognitionState path).
+        self._update_overlay(state)
+
         return False  # Remove idle callback
+
+    def _update_overlay(self, state: RecognitionState):
+        """Show/hide the floating dictation overlay for the given state."""
+        if getattr(self, "overlay", None) is None:
+            return
+        # Re-read config so Settings toggles apply without restart.
+        self.overlay.set_enabled(self.config_manager.is_overlay_enabled())
+        self.overlay.on_recognition_state(state)
+
+    def set_overlay_enabled(self, enabled: bool) -> None:
+        """Live-update overlay enabled state (called from Settings)."""
+        self.config_manager.set_overlay_enabled(enabled)
+        if getattr(self, "overlay", None) is None:
+            return
+        self.overlay.set_enabled(enabled)
+        # Re-apply current recognition state so hide/show is immediate.
+        self.overlay.on_recognition_state(self.speech_engine.state)
 
     def _set_menu_item_enabled(self, label: str, enabled: bool):
         """
@@ -774,6 +1242,74 @@ class TrayIndicator:
         """Handle click on the Stop Voice Typing menu item."""
         logger.debug("Stop Voice Typing clicked")
         self.speech_engine.stop_recognition()
+
+    def _refresh_history_menu(self) -> bool:
+        """Rebuild the Recent Snippets submenu from the current history."""
+        if self._history_menu_item is None or self.transcription_history is None:
+            return False  # Remove idle callback
+
+        submenu = Gtk.Menu()
+        entries = self.transcription_history.get_all()
+
+        if not entries:
+            empty_item = Gtk.MenuItem.new_with_label("(no snippets yet)")
+            empty_item.set_sensitive(False)
+            submenu.append(empty_item)
+        else:
+            for entry in entries:
+                item = Gtk.MenuItem.new_with_label(self._truncate_label(entry))
+                item.set_tooltip_text(entry)
+                # The full snippet is passed as connect user-data, so each item
+                # copies its own text (no late-binding closure pitfall).
+                item.connect("activate", self._on_history_item_clicked, entry)
+                submenu.append(item)
+
+            submenu.append(Gtk.SeparatorMenuItem())
+            clear_item = Gtk.MenuItem.new_with_label("Clear History")
+            clear_item.connect("activate", self._on_clear_history_clicked)
+            submenu.append(clear_item)
+
+        submenu.show_all()
+        self._history_menu_item.set_submenu(submenu)
+        return False  # Remove idle callback
+
+    @staticmethod
+    def _truncate_label(text: str) -> str:
+        """Collapse whitespace and truncate a snippet for menu display."""
+        single_line = " ".join(text.split())
+        if len(single_line) > _HISTORY_LABEL_MAX_CHARS:
+            return single_line[: _HISTORY_LABEL_MAX_CHARS - 1].rstrip() + "…"
+        return single_line
+
+    def _on_history_item_clicked(self, widget: Gtk.MenuItem, text: str) -> None:
+        """Copy the selected snippet to the clipboard."""
+        logger.debug("History snippet clicked, copying to clipboard")
+        # Lazy import keeps the module importable when gi.repository is a
+        # minimal test stand-in (e.g. the AppIndicator fallback tests).
+        from gi.repository import Gdk
+
+        clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        clipboard.set_text(text, -1)
+        clipboard.store()
+
+    def _on_clear_history_clicked(self, widget: Gtk.MenuItem) -> None:
+        """Clear all stored snippets."""
+        logger.debug("Clear history clicked")
+        self.clear_transcription_history()
+
+    def clear_transcription_history(self) -> None:
+        """Wipe every stored snippet, on disk as well as in memory.
+
+        Shared by the tray menu item and the Settings clear button.
+        """
+        if self.transcription_history is not None:
+            self.transcription_history.clear()
+
+    def _on_dictation_pad_clicked(self, widget: Gtk.MenuItem) -> None:
+        """Handle click on the Dictation Pad menu item."""
+        logger.debug("Dictation Pad clicked")
+        if self.dictation_pad is not None:
+            self.dictation_pad.show_pad()
 
     def _on_settings_clicked(self, widget):
         """Handle click on the Settings menu item."""
@@ -804,6 +1340,11 @@ class TrayIndicator:
             update_status_callback=lambda available, release: self._apply_update_status(
                 available, release, notify=False
             ),
+            overlay_enabled_callback=self.set_overlay_enabled,
+            hotkey_listener_update_callback=self._setup_keyboard_shortcuts,
+            language_shortcuts_update_callback=self.refresh_language_shortcuts,
+            history_update_callback=self._apply_history_settings,
+            history_clear_callback=self.clear_transcription_history,
         )
         dialog.connect("response", self._on_settings_dialog_response)
         dialog.connect("destroy", self._on_settings_dialog_destroyed)
@@ -963,11 +1504,6 @@ class TrayIndicator:
         logger.debug("No changes needed - shortcut and mode unchanged")
         return True
 
-    def _on_about_clicked(self, widget):
-        """Handle click on the About menu item."""
-        logger.debug("About clicked")
-        self._show_settings_page("about")
-
     def _get_auto_pause_config(self):
         """Return (enabled, apps, poll_interval_seconds) for AutoPauseMonitor."""
         enabled = self.config_manager.get_bool("auto_pause", "enabled", False)
@@ -1059,7 +1595,14 @@ class TrayIndicator:
             logger.info("Skipping resume reinit: auto-pause still active")
         else:
             GLib.timeout_add_seconds(2, self._reinit_speech_after_resume)
-        GLib.timeout_add_seconds(2, self._start_input_device_monitor)
+
+        # External-activation mode never started the /dev/input listener in
+        # the first place; watching it here on every resume would open the
+        # very file descriptor that mode promises to avoid.
+        if self._external_activation_active():
+            logger.info("Skipping input device monitor: external activation via D-Bus")
+        else:
+            GLib.timeout_add_seconds(2, self._start_input_device_monitor)
 
     def _reinit_speech_after_resume(self):
         try:
@@ -1127,6 +1670,32 @@ class TrayIndicator:
             self._input_monitor.cancel()
             self._input_monitor = None
 
+    def _on_gateway_status_for_tray(self, status: GatewayStatus, detail: str) -> None:
+        """Update tray Stop local Gateway visibility from a worker thread."""
+        GLib.idle_add(self._sync_gateway_stop_menu, status)
+
+    def _sync_gateway_stop_menu(self, status: GatewayStatus) -> bool:
+        item = getattr(self, "_gateway_stop_menu_item", None)
+        if item is None:
+            return False
+        # Show Stop for leftover compose too; managed_by_us is session memory only.
+        show = status in {
+            GatewayStatus.STARTING,
+            GatewayStatus.LIVE,
+            GatewayStatus.PAIRABLE,
+            GatewayStatus.READY,
+            GatewayStatus.ERROR,
+        }
+        if show:
+            item.show()
+        else:
+            item.hide()
+        return False
+
+    def _on_stop_local_gateway_clicked(self, widget: Any) -> None:
+        """Stop local compose, including leftovers from a previous session."""
+        get_gateway_embed_manager().stop_async()
+
     def _on_quit_clicked(self, widget):
         """Handle click on the Quit menu item."""
         logger.debug("Quit clicked")
@@ -1135,6 +1704,17 @@ class TrayIndicator:
     def _quit(self):
         """Quit the application."""
         logger.info("Quitting application")
+
+        # stop_recognition is not called here (it would play the stop cue and
+        # join the capture thread). Put the speakers back before the process
+        # exits; a crash that skips this still restores on the next launch.
+        engine = getattr(self, "speech_engine", None)
+        release = getattr(engine, "release_playback_duck", None)
+        if callable(release):
+            try:
+                release()
+            except Exception:
+                logger.error("Could not restore playback volume while quitting", exc_info=True)
 
         if self._suspend_handler is not None:
             self._suspend_handler.shutdown()
@@ -1148,10 +1728,27 @@ class TrayIndicator:
         if getattr(self, "_update_monitor", None) is not None:
             self._update_monitor.shutdown()
 
+        if getattr(self, "_dbus_service", None) is not None:
+            self._dbus_service.shutdown()
+
         self._cleanup_input_monitor()
 
-        # Stop the keyboard shortcut manager
+        # Stop the keyboard shortcut managers
         self.shortcut_manager.stop()
+        self._stop_language_shortcut_managers()
+
+        if getattr(self, "overlay", None) is not None:
+            self.overlay.destroy()
+            self.overlay = None
+
+        # Drain the post-processing worker before the injector stops: queued
+        # segments are cancelled and a running job drops its result, so no
+        # injection can land once the injector is gone.
+        if getattr(self, "_on_quit", None) is not None:
+            try:
+                self._on_quit()
+            except Exception:
+                logger.error("Error draining post-processing worker while quitting", exc_info=True)
 
         # Stop the text injector (restores previous IBus engine)
         if hasattr(self, "text_injector") and self.text_injector is not None:

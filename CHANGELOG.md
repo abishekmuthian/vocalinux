@@ -12,11 +12,11 @@ Release history for Vocalinux.
 
 ## Current stable
 
-**[v0.17.0](https://github.com/VocaHQ/vocalinux/releases/tag/v0.17.0)** (2026-09-16)
+**[v0.18.1](https://github.com/VocaHQ/vocalinux/releases/tag/v0.18.1)** (2026-10-08)
 
-Minor on the stable line: Faster Whisper and Parakeet local engines, Speech Model simple setup, first-run system language, Snap packaging with ydotool/`uinput`, Flatpak bundles attached by the release workflow, and injection/settings/audio fixes (HDA analog mics at native layout, native GTK OS dark/light, English-only models no longer trap other languages).
+Patch on the stable line: a Settings Proxy page for model downloads and update checks behind SOCKS5/HTTP proxies, opt-in JSONL transcript persistence so a failed injection no longer loses the text, .deb and .rpm release packages for Debian and Fedora, a slimmer tray menu (Start on Login and About now live only in Settings), and reliability fixes for the Dictation Pad on Wayland, evdev keyboard discovery, KDE Plasma 6 letter case, a dead Initial Prompt field in Settings, save dialogs that could double the `.txt` extension, and a Speech Model picker that stages changes until you confirm the download.
 
-See [docs/UPDATE.md](docs/UPDATE.md#whats-new-in-v0170) for the highlight table, or the [GitHub Release](https://github.com/VocaHQ/vocalinux/releases/tag/v0.17.0).
+See [docs/UPDATE.md](docs/UPDATE.md#whats-new-in-v0181) for the highlight table, or the [GitHub Release](https://github.com/VocaHQ/vocalinux/releases/tag/v0.18.1).
 
 ## Earlier versions
 

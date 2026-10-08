@@ -6,6 +6,7 @@ for whisper.cpp, supporting Vulkan, CUDA, and CPU backends.
 """
 
 import logging
+import math
 import os
 import re
 import subprocess
@@ -25,7 +26,23 @@ logger = logging.getLogger(__name__)
 # sha256 per file, and a file replaced upstream would turn every download into a
 # checksum failure. Both the pin and the digests are refreshed together by
 # scripts/generate-model-checksums.py.
-_WHISPERCPP_REPO = "https://huggingface.co/ggerganov/whisper.cpp/resolve"
+_WHISPERCPP_REPO_SLUG = "ggerganov/whisper.cpp"
+_WHISPERCPP_REPO = f"https://huggingface.co/{_WHISPERCPP_REPO_SLUG}/resolve"
+
+# TinyDiarize (tdrz) ships from its own upstream repository — the main one
+# carries only dictation weights. The repo is static since 2023, so the
+# commit is pinned here rather than in model_checksums.txt like the others.
+_TDRZ_REPO = "akashmjn/tinydiarize-whisper.cpp"
+_TDRZ_REVISION = "d44ba793fc67e509623a88a409723311fa677744"
+
+#: Catalog model for speaker-turn diarization. TinyDiarize emits
+#: ``[SPEAKER_TURN]`` markup rather than plain text, so it is fetchable through
+#: the catalog but must never be offered or accepted as a dictation model:
+#: bracketed tokens would type noise into the focused window.
+TDRZ_MODEL = "small.en-tdrz"
+
+#: whisper.cpp catalog models that are not usable for keystroke dictation.
+NON_DICTATION_MODELS = frozenset({TDRZ_MODEL})
 
 
 def whispercpp_model_file(model_name: str) -> str:
@@ -39,6 +56,11 @@ def whispercpp_model_file(model_name: str) -> str:
 
 def _model_url(model_name: str) -> str:
     """Build the Hugging Face URL for a ggml whisper.cpp model."""
+    if model_name in NON_DICTATION_MODELS:
+        repo, revision = _WHISPERCPP_SIDE_SOURCES[model_name]
+        return (
+            f"https://huggingface.co/{repo}/resolve/{revision}/{whispercpp_model_file(model_name)}"
+        )
     return f"{_WHISPERCPP_REPO}/{whispercpp_revision()}/{whispercpp_model_file(model_name)}"
 
 
@@ -72,7 +94,15 @@ _WHISPERCPP_MODEL_SPECS = [
     ("large-v3-turbo", 1620, "809M", "High accuracy, lower memory than large"),
     ("large-v3-turbo-q5_0", 574, "809M", "Quantized large v3 Turbo model"),
     ("large-v3-turbo-q8_0", 874, "809M", "Q8 quantized large v3 Turbo model"),
+    ("small.en-tdrz", 465, "244M", "TinyDiarize speaker-turn model, English-only"),
 ]
+
+#: Repository ``(slug, pinned_revision)`` for catalog models hosted outside the
+#: main whisper.cpp repository. Keyed by model name; also drives
+#: :func:`whispercpp_model_source`.
+_WHISPERCPP_SIDE_SOURCES = {
+    TDRZ_MODEL: (_TDRZ_REPO, _TDRZ_REVISION),
+}
 
 WHISPERCPP_MODEL_INFO = {
     spec[0]: {
@@ -147,6 +177,26 @@ def default_variant_for_size(model_size: str, language_is_english: bool) -> Opti
 def is_english_only_model(model_name: str) -> bool:
     """Return whether a whisper.cpp model variant is English-only."""
     return ".en" in model_name.lower()
+
+
+def is_dictation_model(model_name: str) -> bool:
+    """Return whether a catalog model is a valid keystroke-dictation model."""
+    return model_name in WHISPERCPP_MODEL_INFO and model_name not in NON_DICTATION_MODELS
+
+
+def whispercpp_model_source(model_name: str) -> tuple[str, str]:
+    """Return the ``(repo_slug, pinned_revision)`` hosting a catalog model.
+
+    Main-repository models return an empty revision: their digests are pinned
+    to the commit recorded in ``model_checksums.txt`` and re-resolved by
+    ``scripts/generate-model-checksums.py`` each run. Models hosted in a
+    separate repository pin their own commit in this module, the same way
+    parakeet bundles pin theirs.
+    """
+    source = _WHISPERCPP_SIDE_SOURCES.get(model_name)
+    if source is not None:
+        return source
+    return _WHISPERCPP_REPO_SLUG, ""
 
 
 # Compute backend types
@@ -426,6 +476,24 @@ def detect_cpu_info() -> str:
     return "CPU"
 
 
+def _parse_cuda_vram_gib(backend_info: str) -> Optional[float]:
+    """Parse VRAM in GiB from nvidia-smi-style backend info.
+
+    Accepts MiB/MB/GiB/GB (case-insensitive). MiB and MB are converted by
+    dividing by 1024. Returns None when no size can be parsed.
+    """
+    if not isinstance(backend_info, str) or not backend_info:
+        return None
+    match = re.search(r"(\d+(?:\.\d+)?)\s*(gi?b|mi?b)", backend_info, flags=re.IGNORECASE)
+    if not match:
+        return None
+    amount = float(match.group(1))
+    unit = match.group(2).lower()
+    if unit in {"mb", "mib"}:
+        amount /= 1024.0
+    return amount
+
+
 def get_recommended_model() -> tuple[str, str]:
     """
     Get the recommended whisper.cpp model based on system configuration.
@@ -436,7 +504,7 @@ def get_recommended_model() -> tuple[str, str]:
     try:
         import psutil
 
-        ram_gb = psutil.virtual_memory().total // (1024**3)
+        ram_gb = math.ceil(psutil.virtual_memory().total / (1024**3))
 
         # Detect available compute backends
         backend, backend_info = detect_compute_backend()
@@ -448,19 +516,14 @@ def get_recommended_model() -> tuple[str, str]:
             else:
                 return "base", f"Vulkan GPU with {ram_gb}GB RAM"
         elif backend == ComputeBackend.CUDA:
-            # CUDA has more VRAM typically
-            if "GB" in backend_info:
-                try:
-                    vram_gb = int(backend_info.split("GB")[0].split("(")[-1].strip())
-                    if vram_gb >= 8:
-                        return "medium", f"CUDA GPU with {vram_gb}GB VRAM"
-                    elif vram_gb >= 4:
-                        return "small", f"CUDA GPU with {vram_gb}GB VRAM"
-                    else:
-                        return "base", f"CUDA GPU with limited VRAM"
-                except (ValueError, IndexError):
-                    pass
-            return "small", f"CUDA GPU detected"
+            vram_gb = _parse_cuda_vram_gib(backend_info or "")
+            if vram_gb is not None:
+                if vram_gb >= 8:
+                    return "medium", f"CUDA GPU with {vram_gb:g}GB VRAM"
+                if vram_gb >= 4:
+                    return "small", f"CUDA GPU with {vram_gb:g}GB VRAM"
+                return "base", "CUDA GPU with limited VRAM"
+            return "small", "CUDA GPU detected"
         else:
             # CPU-only recommendations based on RAM
             if ram_gb >= 16:
@@ -477,6 +540,17 @@ def get_recommended_model() -> tuple[str, str]:
     return "tiny", "Default recommendation"
 
 
+def _model_file_path(model_name: str) -> str:
+    """Resolve the model file path without touching the filesystem."""
+    whispercpp_dir = os.path.join(models_dir(), "whispercpp")
+
+    model_info = WHISPERCPP_MODEL_INFO.get(model_name)
+    if model_info and model_info.get("url"):
+        return os.path.join(whispercpp_dir, os.path.basename(model_info["url"]))
+
+    return os.path.join(whispercpp_dir, f"ggml-{model_name}.bin")
+
+
 def get_model_path(model_name: str) -> str:
     """
     Get the path where a model should be stored.
@@ -487,19 +561,17 @@ def get_model_path(model_name: str) -> str:
     Returns:
         Path to the model file
     """
-    whispercpp_dir = os.path.join(models_dir(), "whispercpp")
-    os.makedirs(whispercpp_dir, exist_ok=True)
-
-    model_info = WHISPERCPP_MODEL_INFO.get(model_name)
-    if model_info and model_info.get("url"):
-        return os.path.join(whispercpp_dir, os.path.basename(model_info["url"]))
-
-    return os.path.join(whispercpp_dir, f"ggml-{model_name}.bin")
+    model_path = _model_file_path(model_name)
+    os.makedirs(os.path.dirname(model_path), exist_ok=True)
+    return model_path
 
 
 def is_model_downloaded(model_name: str) -> bool:
     """
     Check if a whisper.cpp model is downloaded.
+
+    A read-only probe: it must not create the models directory, so it resolves
+    the file path without get_model_path's makedirs side effect.
 
     Args:
         model_name: Name of the model
@@ -507,8 +579,39 @@ def is_model_downloaded(model_name: str) -> bool:
     Returns:
         True if model exists, False otherwise
     """
-    model_path = get_model_path(model_name)
-    return os.path.exists(model_path)
+    return os.path.exists(_model_file_path(model_name))
+
+
+def on_disk_stand_in(variant: str, size: str, language_is_english: bool) -> str:
+    """Prefer a downloaded weight of the same size over fetching a sibling.
+
+    A resolved variant whose weights are absent stands down for a downloaded
+    same-size weight that can serve the language: an English-only weight
+    stands in only when English is wanted. The resolved variant itself wins
+    whenever it is already downloaded, so the ``.en`` preference and explicit
+    picks are kept whenever their files are present.
+    """
+    if is_model_downloaded(variant):
+        return variant
+
+    candidates = [
+        name
+        for name in get_model_variants(size)
+        if is_model_downloaded(name) and (language_is_english or not is_english_only_model(name))
+    ]
+    if not candidates:
+        return variant
+
+    def rank(name: str) -> tuple:
+        # Closest to what was derived: English-only first when English is
+        # wanted, the plain multilingual next, quantized ones last.
+        english_first = 0 if language_is_english and is_english_only_model(name) else 1
+        quantized = 1 if "-q" in name else 0
+        return (english_first, quantized, name)
+
+    chosen = min(candidates, key=rank)
+    logger.info("whisper.cpp model %s is not downloaded; using same-size %s", variant, chosen)
+    return chosen
 
 
 def list_downloaded_models() -> list[str]:

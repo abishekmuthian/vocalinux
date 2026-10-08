@@ -20,7 +20,7 @@ The installer detects a running instance, updates in place, preserves configurat
 ```bash
 cd vocalinux
 git fetch origin
-git checkout v0.17.0
+git checkout v0.18.1
 ./install.sh
 ```
 
@@ -38,7 +38,7 @@ git pull origin main
 |--------|---------|
 | AUR | `yay -S vocalinux` (or your AUR helper) |
 | AppImage | Download the new file from [Releases](https://github.com/VocaHQ/vocalinux/releases) |
-| Snap | `sudo snap refresh vocalinux` (`--edge` until stable is promoted). **v0.17.0** ships `uinput`; `sudo snap connect vocalinux:uinput` then restart for native Wayland apps. v0.16.2 rev 7 has no such plug. |
+| Snap | Store: `sudo snap refresh vocalinux` (`--edge` until stable is promoted). Until Canonical lists 0.18.1, sideload `vocalinux_0.18.1_amd64.snap` from the GitHub Release (`sudo snap install --dangerous ./vocalinux_0.18.1_amd64.snap`), then `sudo snap connect vocalinux:uinput`. v0.16.2 rev 7 has no such plug. |
 | Flatpak (release bundle) | Install the new `.flatpak` from Releases; bundles do not auto-update |
 | PyPI | Reinstall in the same venv after system packages are current |
 
@@ -55,7 +55,13 @@ python3 -c "import vocalinux; print(vocalinux.version.__version__)"
 Clean reinstall (keeps config and models by default):
 
 ```bash
+# Source checkout
 ./uninstall.sh --keep-config --keep-data
+
+# Curl install (safe to run from any directory)
+curl -fsSL https://raw.githubusercontent.com/VocaHQ/vocalinux/main/uninstall.sh -o /tmp/vul.sh
+bash /tmp/vul.sh --keep-config --keep-data
+
 curl -fsSL https://raw.githubusercontent.com/VocaHQ/vocalinux/main/install.sh -o /tmp/vl.sh
 bash /tmp/vl.sh
 ```
@@ -70,6 +76,85 @@ vocalinux
 ```
 
 Missing system packages: see [INSTALL.md](INSTALL.md) or [DISTRO_COMPATIBILITY.md](DISTRO_COMPATIBILITY.md).
+
+---
+
+## What's New in v0.18.1
+
+0.18.1 is a **patch** on the stable line. Default engine is still whisper.cpp. This one is a reliability release: most of it is fixes, and the new features are plumbing you will notice only when you need it. Settings gains a Proxy page so model downloads and update checks work behind SOCKS5 and HTTP proxies, and an opt-in switch that persists transcripts to disk so a failed injection stops meaning a lost sentence. Releases now attach native .deb and .rpm packages, and the tray menu drops Start on Login and About (both already lived in Settings).
+
+### 0.18.1 highlights
+
+| Feature | Description |
+|---------|-------------|
+| **Proxy settings** | New Settings -> Proxy page: off, system, or manual SOCKS5/HTTP CONNECT with optional auth; covers every model download and the update checker (#909, fixes #655) |
+| **Transcript persistence** | Opt-in JSONL history on disk; a transcript survives restarts and failed injections (#907, fixes #758) |
+| **Native packages** | Thin .deb and .rpm for Debian/Ubuntu and Fedora, x86_64 and aarch64, attached to the GitHub Release (#913, step 1 of #600) |
+| **Slimmer tray menu** | Start on Login and About removed from the tray; both already live in Settings (#905, fixes #654) |
+| **Staged model picker** | Speech Model Advanced pickers no longer start a download per click; changes stage until you confirm Download (#908, fixes #894) |
+| **Wayland pad fix** | Dictation Pad no longer ghosts away after sitting idle under a Wayland compositor (#912, fixes #896) |
+
+### Also in v0.18.1
+
+- Startup reuses an on-disk same-size whisper.cpp weight instead of re-resolving or re-downloading it (#923, fixes #916 reported by @blacxsnow)
+- Text injection ends option parsing before typed text, so a chunk starting with `-` no longer fails as an unrecognized option and truncates the dictation (#922, fixes #921)
+- KDE Plasma 6 Wayland: KWin VirtualKeyboard detection fixed, so dictated letter case stops scrambling (#919, fixes #911 reported by @blackde5ert)
+- evdev keyboard discovery tightened: pointer-motion devices, multitouch-only touchpads, and devices without a real keyboard key are no longer grabbed as keyboards, so hotkey enablement stops breaking Logitech mice and Goodix touchpads (#902, #917, #918, fixes #900 reported by @brainygamer, #914 reported by @pylame22, #915 reported by @uncletoxa)
+- Test Dictation transcription readout moved above its controls in the sidebar footer (#904, fixes #677 reported by @hopsayer)
+- `uninstall.sh` no longer deletes files in the directory you ran it from (#901, fixes #897 reported by @SilverChatte)
+- Settings > Advanced Initial Prompt accepts typed input again (clicks were being stolen by the enclosing row), and transcript and log saves no longer write a doubled `.txt.txt` name (#927)
+- Packaging: `.deb` declares `python3-socks` and `.rpm` declares `python3-pysocks` for SOCKS5 proxy support (#920)
+- CI: snap attach uses `--repo`, checksums still publish when an asset attach fails, the Vulkan pywhispercpp build is reused across runs, and the remote `curl | bash` install path is gated end to end (#899, #903, #906)
+
+AppImage, Flatpak, and Snap still ship whisper.cpp only.
+
+See the [full changelog](https://github.com/VocaHQ/vocalinux/releases/tag/v0.18.1).
+
+---
+
+## What's New in v0.18.0
+
+0.18.0 is a **minor** on the stable line. Default engine is still whisper.cpp. The headline fix is a grab of the dictation hotkey so the shortcut stops leaking into the app under it. Alongside it is a set of Wayland-native paths: an in-app Dictation Pad that keeps text off the fragile injection routes entirely, PipeWire capture (microphone and system audio), and a RemoteDesktop portal injection backend. Dictation gains per-language shortcuts, a tray history menu, a floating overlay, and audio ducking. Long-requested contributor work lands here too: D-Bus activation for compositor global shortcuts, bilingual language candidates, a postprocessing script hook, a custom dictionary with corrections, and file transcription with speaker labels.
+
+### 0.18 series highlights
+
+| Feature | Description |
+|---------|-------------|
+| **Dictation Pad** | In-app window that receives dictation; you copy text out by hand, so Wayland injection quirks cannot touch it (#887, fixes #726) |
+| **Hotkey suppression** | evdev grabs the dictation shortcut and forwards everything else through a uinput clone; the key no longer types into the focused app (#873, #893, fixes #871) |
+| **PipeWire capture** | Mic and system-audio sources through the native PipeWire path, not just PortAudio (#889, #883, fixes #751, #760) |
+| **RemoteDesktop injection** | Wayland text injection through the RemoteDesktop portal, no ydotoold needed (#885, fixes #750) |
+| **Per-language shortcuts + history** | A dictation shortcut per language, layout-follow while dictating, and recent dictations in the tray menu (#880, #837, #487, fixes #805, #821) |
+| **File transcription with speakers** | `--transcribe-file` with TinyDiarize per-speaker labels, plus a transcript viewer (#884, fixes #756) |
+| **D-Bus activation** | Opt-in D-Bus methods so compositor global shortcuts (and scripts) can start dictation (#568, fixes #761) |
+| **Custom dictionary** | Terms bias plus transcript corrections from one file (#890) |
+
+### Also in v0.18.0
+
+- Postprocessing script hook pipes transcriptions through a user command (#479 by @karottenreibe)
+- Bilingual dictation: configurable second-language Whisper candidates, with deferred settings edits (#424 by @juanfradb)
+- Optional verified Orukeet model for the Parakeet engine (#840 by @Nathan-Roll1)
+- Keep recording while an idle-unloaded model reloads instead of dropping the utterance (#851 by @mre31)
+- Floating glowing dictation overlay and lowering of other audio while dictating (#516, #861)
+- `config.json` can pin the text-injection backend (#649 by @HashimAbdulaziz, fixes #476 reported by @waldemar-p)
+- Alt+Shift and Win+Space layout switching keeps working on GNOME Wayland (#876, fixes #848 reported by @hopsayer)
+- Shortcut recorder learns unmapped F19/F24 and XF86-aliased F13-F23 (#844, fixes #843 reported by @bisgardo)
+- Vosk refuses to load a model that would exceed available memory instead of tripping the OOM killer (#850 by @AmirF194, fixes #676 reported by @hopsayer)
+- IBus guard no longer flips GNOME/X11 to a US layout (#827 by @AmirF194)
+- Model downloads cancel cleanly even when the fetch stalls, and the download dialog shows verifying instead of a stalled 100% (#888, #864 by @guilhermefeitosa66, fixes #679, #863)
+- Settings: scrollable category list, Dictation Tone grayed while sound effects are off, Test Dictation textbox artifact and missing transcription fixed, speech-model follow-ups (#886, #877, #853, #836, fixes #678, #849, #847, #720, #834)
+- Update checker falls back when GitHub API rate-limits instead of erroring (#846, fixes #845 reported by @lmstud)
+- Audio: stop passing an explicit index when zero devices enumerate; View Logs closes via the titlebar X (#891, #892)
+- Snap gains `hardware-observe` so hotkeys can read input devices (#858, fixes #857 reported by @RhysU)
+- Installer installs hash-pinned dependencies and build tools, and is split into sourced modules with a generated distro package map (#856, #862, #872 by @sesav)
+- AUR `vocalinux-bin` ships the AppImage with per-arch digests; releases publish a signed self-hosted Flatpak OSTree remote; a snap-promote workflow gates stable promotion (#879, #875, #881, fixes #817, #785, #783)
+- VocaGateway can run locally from Settings → Advanced (podman-first) (#774)
+- Dependency advisories cleared and workflow tokens scoped to repository reads (#869, #865, #866 by @Mr-Sunglasses, #870)
+- Settings dialog consolidated: guard flags and widget construction in one place each (#878, fixes #793)
+
+AppImage, Flatpak, and Snap still ship whisper.cpp plus the same engine matrix as 0.17.
+
+See the [full changelog](https://github.com/VocaHQ/vocalinux/releases/tag/v0.18.0).
 
 ---
 
@@ -88,7 +173,7 @@ Missing system packages: see [INSTALL.md](INSTALL.md) or [DISTRO_COMPATIBILITY.m
 | **Searchable open picker** | Language list filters while open (#798) |
 | **Localized punctuation commands** | it/fr/de/es/pt/nl/pl/ru; English phrases still work (#642) |
 | **Bare F-keys** | F1–F24 are valid push-to-talk shortcuts (#815) |
-| **Snap** | Store listing, ydotool + `uinput` for native Wayland (#519, #823, #822) |
+| **Snap** | Store listing, ydotool + `uinput` for native Wayland; GitHub `.snap` for sideload while Store review is pending (#519, #823, #822) |
 | **Flatpak on the tag** | Workflow attaches `.flatpak` assets and checksums them (#786) |
 
 ### Also in v0.17.0

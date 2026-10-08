@@ -40,7 +40,7 @@ const homeJsonLd = [
     },
     description:
       "Offline voice dictation and speech-to-text for Linux with whisper.cpp, Faster Whisper, Whisper, VOSK, and Parakeet.",
-    softwareVersion: "0.17.0",
+    softwareVersion: "0.18.1",
     author: {
       "@type": "Person",
       name: "Jatin K Malik",
@@ -938,7 +938,7 @@ export default function HomePage() {
                   />
                   macOS
                 </span>
-                <span className="chip">Beta</span>
+                <span className="chip">Available now</span>
               </div>
               <h3>VocaMac</h3>
               <p>
@@ -984,7 +984,7 @@ export default function HomePage() {
                   </span>
                   iPhone + Android
                 </span>
-                <span className="chip">Phone beta</span>
+                <span className="chip">Android beta / iOS TestFlight</span>
               </div>
               <h3>VocaPhone</h3>
               <p>

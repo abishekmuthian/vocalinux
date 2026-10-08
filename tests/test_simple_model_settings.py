@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, Mock, patch
 import pytest
 
 import vocalinux.ui
+from vocalinux.utils import whispercpp_model_info
 from vocalinux.utils.model_choice import (
     ACCURATE,
     BALANCED,
@@ -60,6 +61,7 @@ def _dialog_stub(language="pl", multi=False, priority=BALANCED, recommended="sma
     dialog.simple_second_language_combo.get_active_id.return_value = second
     dialog.simple_priority_combo.get_active_id.return_value = priority
     dialog._get_recommended_whispercpp_model_for_language.return_value = (recommended, "reason")
+    dialog._get_selected_engine.return_value = "whisper_cpp"
     # The language resolution is the code under test's own helper, not a mock.
     dialog._simple_decoding_language.side_effect = (
         lambda: _sd().SettingsDialog._simple_decoding_language(dialog)
@@ -633,15 +635,17 @@ def test_restoring_after_auto_detect_falls_back_to_a_real_language(settings_dial
 
 
 def _with_disk(settings_dialog, downloaded):
+    # The stand-in helper lives in whispercpp_model_info and reads its own
+    # module globals, so the disk state is patched there, not on the dialog.
     return (
         patch.object(
-            settings_dialog,
-            "is_whispercpp_model_downloaded",
+            whispercpp_model_info,
+            "is_model_downloaded",
             side_effect=lambda name: name in downloaded,
         ),
         patch.object(
-            settings_dialog,
-            "get_whispercpp_model_variants",
+            whispercpp_model_info,
+            "get_model_variants",
             return_value=["base", "base.en", "base-q5_1", "base.en-q5_1", "base-q8_0"],
         ),
     )
@@ -686,6 +690,38 @@ def test_a_plain_weight_is_preferred_over_a_quantized_one(settings_dialog, dialo
     on_disk, variants = _with_disk(settings_dialog, ["base-q5_1", "base"])
     with on_disk, variants:
         assert dialog_class._on_disk_stand_in(Mock(), "base.en", "base", "en-us") == "base"
+
+
+@pytest.mark.parametrize("engine", ["faster_whisper", "parakeet"])
+def test_simple_choice_leaves_faster_whisper_and_parakeet_alone(
+    settings_dialog, dialog_class, engine
+):
+    """Editing a simple question must not yank Advanced off Faster Whisper or Parakeet."""
+    dialog = _dialog_stub(language="en-us", multi=False, priority=BALANCED, recommended="small")
+    dialog._get_selected_engine.return_value = engine
+
+    dialog_class._apply_simple_choice(dialog)
+
+    dialog.engine_combo.set_active_id.assert_not_called()
+    dialog._set_combo_active_id_or_first.assert_called_once_with(dialog.language_combo, "en-us")
+    assert dialog.language == "en-us"
+    dialog.model_combo.set_active_id.assert_not_called()
+    dialog.model_variant_combo.set_active_id.assert_not_called()
+
+
+@pytest.mark.parametrize("engine", ["vosk", "remote_api", "whisper", "unknown"])
+def test_simple_choice_steers_incompatible_engines_to_whisper_cpp(
+    settings_dialog, dialog_class, engine
+):
+    dialog = _dialog_stub(language="pl", multi=False, priority=BALANCED, recommended="small")
+    dialog._get_selected_engine.return_value = engine
+
+    dialog_class._apply_simple_choice(dialog)
+
+    dialog.engine_combo.set_active_id.assert_called_once_with("whisper_cpp")
+    dialog._set_combo_active_id_or_first.assert_called_once_with(dialog.language_combo, "pl")
+    dialog.model_combo.set_active_id.assert_called_once_with("small")
+    dialog.model_variant_combo.set_active_id.assert_called_once_with("small")
 
 
 def test_simple_mode_consults_the_disk_before_settling_on_a_variant(settings_dialog, dialog_class):

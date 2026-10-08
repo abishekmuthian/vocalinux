@@ -42,6 +42,7 @@ dependencies = [
     "pynput>=1.7.6,<2",
     "evdev>=1.6.0,<2; sys_platform == 'linux'",
     "requests>=2.28.0",
+    "PySocks>=1.7.1,<2",
     "numpy>=1.22.0,<3",
     "pyaudio>=0.2.13",
     "PyGObject; sys_platform == 'linux'",
@@ -54,8 +55,7 @@ vosk = [
 ]
 whisper = [
     "openai-whisper>=20231117",
-    "torch>=2.0.0",
-    "torchaudio>=2.0.0",
+    "torch>=2.13.0",
 ]
 parakeet = [
     "sherpa-onnx>=1.12.0,<2",
@@ -73,6 +73,7 @@ dev = [
     "pytest-timeout>=2.1.0",
     "pre-commit>=3.0.0",
     "mypy>=1.0.0",
+    "pyyaml>=6.0,<7",
 ]
 docs = [
     "sphinx>=6.0.0",
@@ -83,6 +84,20 @@ docs = [
 # --only-group lint` installs them without the project, so the lint job needs
 # no portaudio/girepository headers to build pyaudio and PyGObject.
 [dependency-groups]
+# install.sh installs this wheel-only toolchain before any source builds, then
+# disables build isolation so pip cannot resolve another unpinned environment.
+installer-build = [
+    "pip>=25.3,<27",
+    # Torch 2.13 supports setuptools 82+, so keep this at the patched version
+    # for setuptools' 2026 sdist normalization advisory.
+    "setuptools>=83",
+    "wheel",
+    "meson-python>=0.16",
+    "cmake==3.31.10",
+    "ninja==1.13.0",
+    "repairwheel",
+    "setuptools-scm>=8",
+]
 lint = [
     "black>=23.0.0",
     "isort>=5.12.0",
@@ -111,6 +126,8 @@ required-version = ">=0.12,<0.13"
 # Resource dirs carry no .py files, but setuptools still treats them as packages.
 packages = [
     "vocalinux",
+    "vocalinux.audio",
+    "vocalinux.gateway_embed",
     "vocalinux.resources",
     "vocalinux.resources.icons",
     "vocalinux.resources.icons.scalable",
@@ -170,6 +187,10 @@ markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "integration: marks tests as integration tests",
     "audio: marks tests that require audio hardware",
+]
+filterwarnings = [
+    "ignore:The NumPy module was reloaded:UserWarning",
+    "ignore:There is no current event loop:DeprecationWarning",
 ]
 
 [tool.coverage.run]

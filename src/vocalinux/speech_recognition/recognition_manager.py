@@ -13,17 +13,40 @@ import logging
 import os
 import queue
 import re
+import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional, Union
 
 if TYPE_CHECKING:
     import numpy as np
+    import requests
 
+from ..audio.capture import (  # noqa: F401  (re-exported for compatibility)
+    _STICKY_LOCK_MIN_MEAN_SQUARE,
+    PortAudioCaptureSource,
+    _alsa_handler,
+    _downmix_to_mono,
+    _get_device_info_safe,
+    _get_supported_channels,
+    _get_supported_sample_rate,
+    _is_bluetooth_device,
+    _is_virtual_device,
+    _open_capture_stream,
+    _resolve_device_by_name,
+    _resolve_valid_input_device,
+    _safe_close_stream,
+    _setup_alsa_error_handler,
+    get_audio_input_devices,
+    test_audio_input,
+)
+from ..audio.pipewire import PipeWireCaptureSource, is_pipewire_device
+from ..audio.playback_ducker import default_dictation_duck_session, duck_delay_seconds
 from ..common_types import RecognitionState
 from ..ui.audio_feedback import play_error_sound, play_start_sound, play_stop_sound
+from ..ui.config_manager import _multilingual_sibling
 from ..utils import faster_whisper_model_info as faster_whisper
 from ..utils import parakeet_model_info as parakeet
 from ..utils.host_process import host_env
@@ -34,17 +57,58 @@ from ..utils.model_checksums import (
     write_verification_stamp,
 )
 from ..utils.paths import models_dir
+from ..utils.proxy import requests_proxies
+from ..utils.pywhispercpp_loader import (
+    find_shared_library_dirs as _find_pywhispercpp_shared_library_dirs,
+)
+from ..utils.pywhispercpp_loader import (
+    preload_shared_libraries as _preload_pywhispercpp_shared_libraries,
+)
+from ..utils.system_language import LANGUAGE_FOLLOWS_LAYOUT, language_for_active_layout
 from ..utils.vosk_model_info import SUPPORTED_LANGUAGES, VOSK_MODEL_INFO
 from ..utils.whisper_model_info import (
     migrate_legacy_checkpoint_names,
     whisper_model_file,
     whisper_model_url,
 )
-from ..utils.whispercpp_model_info import WHISPERCPP_MODEL_INFO, get_model_path, is_model_downloaded
+from ..utils.whispercpp_model_info import (
+    NON_DICTATION_MODELS,
+    WHISPERCPP_MODEL_INFO,
+    get_model_path,
+    is_english_only_model,
+    is_model_downloaded,
+)
 from ..version import __version__
 from .command_processor import CommandProcessor
 from .dictionary_corrector import apply_dictionary, load_custom_dictionary
 from .silero_vad import SILERO_CHUNK_SIZE, load_silero_vad
+
+if TYPE_CHECKING:
+    from ..custom_dictionary import CustomDictionaryManager
+
+
+class _AudioSegment(list):
+    """A queued audio segment that knows when its capture began.
+
+    Stays a plain ``list`` of chunks so consumers (including tests that put
+    or compare raw buffers) see an ordinary segment; ``started_at`` is the
+    ``time.monotonic()`` timestamp of its first captured chunk. That stamp
+    is what lets a listener tell speech captured before a point in time
+    from speech captured after it, however late the decode finishes.
+    """
+
+    def __init__(
+        self,
+        chunks: list[bytes],
+        started_at: Optional[float],
+        language: Optional[str] = None,
+    ) -> None:
+        super().__init__(chunks)
+        self.started_at = started_at
+        # The language this utterance was dictated under (#805): a worker that
+        # outlives its session must not transcribe a stale segment in a newer
+        # session's language.
+        self.language = language
 
 
 def _pywhispercpp_distribution_version() -> Optional[tuple[int, ...]]:
@@ -102,793 +166,33 @@ def normalize_language_for_engine(engine: str, language: str) -> str:
     return language
 
 
-# ALSA error handler to suppress warnings during PyAudio initialization
-def _setup_alsa_error_handler():
-    """Set up an error handler to suppress ALSA warnings."""
-    try:
-        # Try multiple library name variations for cross-distro compatibility
-        # Different distributions may use different soname or library naming
-        for lib_name in ["libasound.so.2", "libasound.so", "libasound.so.0", "asound"]:
-            try:
-                asound = ctypes.CDLL(lib_name)
-                # Define error handler type
-                ERROR_HANDLER_FUNC = ctypes.CFUNCTYPE(
-                    None,
-                    ctypes.c_char_p,
-                    ctypes.c_int,
-                    ctypes.c_char_p,
-                    ctypes.c_int,
-                    ctypes.c_char_p,
-                )
+def resolve_language_preference(language: str) -> str:
+    """Turn a stored language preference into one an engine can consume (#821).
 
-                # Create a no-op error handler
-                def _error_handler(filename, line, function, err, fmt):
-                    pass
-
-                _alsa_error_handler = ERROR_HANDLER_FUNC(_error_handler)
-                asound.snd_lib_error_set_handler(_alsa_error_handler)
-                # Note: Can't use logger here as it's not defined yet
-                return _alsa_error_handler  # Keep reference to prevent GC
-            except OSError:
-                continue
-        # If all library names fail, return None
-        return None
-    except (OSError, AttributeError):
-        # ALSA not available or different platform
-        return None
-
-
-# Set up ALSA error handler at module load time
-_alsa_handler = _setup_alsa_error_handler()
-
-_PYWHISPERCPP_PRELOADED_LIBS: list[ctypes.CDLL] = []
-
-
-def _find_pywhispercpp_shared_library_dirs() -> list[str]:
-    """Find bundled pywhispercpp native library directories without importing it."""
-    candidate_dirs: list[Path] = []
-
-    for module_name in ("_pywhispercpp", "pywhispercpp"):
-        try:
-            spec = importlib.util.find_spec(module_name)
-        except (ImportError, AttributeError, ValueError):
-            spec = None
-        if spec is None:
-            continue
-
-        if spec.origin:
-            module_dir = Path(spec.origin).resolve().parent
-            candidate_dirs.extend(
-                [
-                    module_dir,
-                    module_dir / ".libs",
-                    module_dir / "lib",
-                    module_dir / "pywhispercpp.libs",
-                    module_dir.parent / "pywhispercpp.libs",
-                ]
-            )
-
-        if spec.submodule_search_locations:
-            for location in spec.submodule_search_locations:
-                package_dir = Path(location).resolve()
-                candidate_dirs.extend(
-                    [
-                        package_dir,
-                        package_dir / ".libs",
-                        package_dir / "lib",
-                        package_dir.parent / "pywhispercpp.libs",
-                    ]
-                )
-
-    for path_entry in sys.path:
-        if not path_entry:
-            continue
-        path_root = Path(path_entry).resolve()
-        candidate_dirs.append(path_root / "pywhispercpp.libs")
-
-    library_dirs: list[str] = []
-    seen: set[str] = set()
-    for candidate_dir in candidate_dirs:
-        try:
-            resolved_dir = str(candidate_dir.resolve())
-            if resolved_dir in seen or not candidate_dir.is_dir():
-                continue
-
-            has_native_lib = any(candidate_dir.glob("libwhisper*.so*")) or any(
-                candidate_dir.glob("libggml*.so*")
-            )
-        except (OSError, TypeError, ValueError):
-            # TypeError/ValueError can surface when tests monkey-patch os.stat or
-            # when pathlib internals receive unexpected types from mocks.
-            continue
-
-        if has_native_lib:
-            seen.add(resolved_dir)
-            library_dirs.append(resolved_dir)
-
-    return library_dirs
-
-
-def _preload_pywhispercpp_shared_libraries() -> None:
-    """Preload bundled pywhispercpp shared libraries for source-built installs.
-
-    Some source builds place libwhisper/libggml next to the Python extension
-    without an RPATH. Preloading by absolute path lets the dynamic loader satisfy
-    the extension's libwhisper.so.1 dependency before importing pywhispercpp.
+    ``layout`` is not a language: it asks for whatever the active keyboard
+    layout points at, which is why this resolves fresh on every call rather
+    than once at startup. A layout that cannot be read, or that maps to nothing
+    in the catalogue, degrades to ``auto`` -- the same answer the engine would
+    have reached on its own, and better than refusing to dictate.
     """
-    if _PYWHISPERCPP_PRELOADED_LIBS:
-        return
-
-    libraries: list[Path] = []
-    for library_dir in _find_pywhispercpp_shared_library_dirs():
-        root = Path(library_dir)
-        libraries.extend(sorted(root.glob("libggml*.so*")))
-        libraries.extend(sorted(root.glob("libwhisper*.so*")))
-
-    if not libraries:
-        return
-
-    pending = list(dict.fromkeys(libraries))
-    loaded: list[ctypes.CDLL] = []
-    last_errors: dict[str, OSError] = {}
-    mode = getattr(ctypes, "RTLD_GLOBAL", 0)
-
-    # Native libs can depend on each other. Retry while progress is made so a
-    # dependency loaded earlier in the same directory can unlock later libraries.
-    while pending:
-        loaded_this_pass = False
-        for library_path in pending[:]:
-            try:
-                loaded.append(ctypes.CDLL(str(library_path), mode=mode))
-                pending.remove(library_path)
-                loaded_this_pass = True
-            except OSError as e:
-                last_errors[str(library_path)] = e
-
-        if not loaded_this_pass:
-            break
-
-    _PYWHISPERCPP_PRELOADED_LIBS.extend(loaded)
-
-    if pending:
-        logger.debug(
-            "Could not preload all pywhispercpp native libraries: %s",
-            {str(path): str(last_errors.get(str(path))) for path in pending},
-        )
-
-
-def _is_virtual_device(device_name: str) -> bool:
-    """Check if a device name corresponds to a virtual audio device.
-
-    Virtual devices (e.g. speech-dispatcher-dummy, PulseAudio monitors,
-    PipeWire null sinks) cannot be used for recording and may cause crashes
-    if PortAudio tries to open them.
-
-    Args:
-        device_name: The device name to check.
-
-    Returns:
-        True if the device appears to be virtual, False otherwise.
-    """
-    if not device_name:
-        return False
-    name_lower = device_name.strip().lower()
-    virtual_exact_names = {
-        "default",
-        "monitor",
-        "paplay",
-        "pipewire",
-    }
-    virtual_prefixes = ("default:", "pipewire:", "pipewire ")
-    virtual_patterns = [
-        ".monitor",
-        "_monitor",
-        "-monitor",
-        "alsa_output",  # ALSA output devices exposed as monitors
-        "deepfilternet",
-        "dummy",
-        "filter-chain",
-        "filter_chain",
-        "monitor of",
-        "null sink",
-        "null source",
-        "null-sink",
-        "null-source",
-        "null_sink",
-        "null_source",
-        "paplay",
-        "speech-dispatcher",
-        "speechdispatcher",
-    ]
-    return (
-        name_lower in virtual_exact_names
-        or name_lower.startswith(virtual_prefixes)
-        or any(pattern in name_lower for pattern in virtual_patterns)
-    )
-
-
-def _is_bluetooth_device(device_name: Optional[str]) -> bool:
-    """Return True if the device name looks like a Bluetooth headset/mic."""
-    if not device_name:
-        return False
-    name_lower = device_name.lower()
-    # Prefer explicit Bluetooth/BlueZ markers. Avoid bare "headset" which also
-    # matches many wired USB headsets that do not need SCO settle delays.
-    bluetooth_patterns = (
-        "bluetooth",
-        "bluez",
-        "hands-free",
-        "handsfree",
-    )
-    return any(pattern in name_lower for pattern in bluetooth_patterns)
-
-
-def _safe_close_stream(stream) -> None:
-    """Stop and close a PortAudio stream without raising.
-
-    Closing an active stream (especially Bluetooth SCO/HFP capture) without
-    stopping it first is a known trigger for PortAudio heap corruption and
-    process abort via malloc assertions.
-    """
-    if stream is None:
-        return
-    try:
-        stop = getattr(stream, "stop_stream", None)
-        if callable(stop):
-            stop()
-    except Exception:
-        pass
-    try:
-        close = getattr(stream, "close", None)
-        if callable(close):
-            close()
-    except Exception:
-        pass
-
-
-def _get_device_info_safe(audio, device_index: Optional[int] = None) -> dict:
-    """Fetch PortAudio device info, returning {} on failure."""
-    try:
-        if device_index is not None:
-            info = audio.get_device_info_by_index(device_index)
-        else:
-            info = audio.get_default_input_device_info()
-        return info if isinstance(info, dict) else {}
-    except (IOError, OSError, TypeError, ValueError, AttributeError):
-        return {}
-
-
-def get_audio_input_devices() -> list:
-    """
-    Get a list of available audio input devices, excluding virtual devices.
-
-    Returns:
-        List of tuples: (device_index, device_name, is_default)
-    """
-    devices = []
-    try:
-        import pyaudio
-
-        audio = pyaudio.PyAudio()
-
-        default_input_device = None
-        try:
-            default_info = audio.get_default_input_device_info()
-            default_input_device = default_info.get("index")
-        except (IOError, OSError):
-            pass  # No default input device
-
-        for i in range(audio.get_device_count()):
-            try:
-                info = audio.get_device_info_by_index(i)
-                # Only include devices that have input channels
-                if info.get("maxInputChannels", 0) > 0:
-                    name = info.get("name", f"Device {i}")
-                    # Skip virtual devices that can cause crashes
-                    if _is_virtual_device(name):
-                        logger.debug(f"Filtering virtual device [{i}]: {name}")
-                        continue
-                    is_default = i == default_input_device
-                    devices.append((i, name, is_default))
-            except (IOError, OSError):
-                continue
-
-        audio.terminate()
-    except ImportError:
-        logger.error("PyAudio not installed, cannot enumerate audio devices")
-    except OSError as e:
-        logger.error(f"Error enumerating audio devices: {e}")
-
-    return devices
-
-
-def _resolve_device_by_name(
-    audio, device_name: Optional[str], fallback_index: Optional[int] = None
-) -> Optional[int]:
-    """Resolve a device index by name, falling back to index, then system default.
-
-    Device indices shift when USB devices are replugged or virtual devices are
-    added/removed. Name matching is more stable.
-    """
-    if not device_name:
-        return _resolve_valid_input_device(audio, fallback_index)
+    if language != LANGUAGE_FOLLOWS_LAYOUT:
+        return language
 
     try:
-        device_count = int(audio.get_device_count())
-    except (IOError, OSError, TypeError, ValueError, AttributeError):
-        return _resolve_valid_input_device(audio, fallback_index)
-
-    # ponytail: just find the index by name, delegate validation to _resolve_valid_input_device
-    for i in range(device_count):
-        try:
-            info = audio.get_device_info_by_index(i)
-        except (IOError, OSError, TypeError, ValueError, AttributeError):
-            continue
-        if isinstance(info, dict) and info.get("name", "") == device_name:
-            return _resolve_valid_input_device(audio, i)
-
-    logger.warning(
-        f"Audio device '{device_name}' not found, falling back to index {fallback_index}"
-    )
-    return _resolve_valid_input_device(audio, fallback_index)
-
-
-def _resolve_valid_input_device(audio, preferred_index: Optional[int] = None) -> Optional[int]:
-    """Resolve a valid audio input device, skipping unsafe or output-only devices.
-
-    Checks that the device has maxInputChannels > 0. Falls back from
-    preferred_index → system default → first available input device.
-
-    Args:
-        audio: PyAudio instance
-        preferred_index: User-configured device index (or None for system default)
-
-    Returns:
-        A valid device index with input channels, or None if none found.
-    """
-    input_device_indices = []
-    default_input_index = None
-
-    try:
-        default_info = audio.get_default_input_device_info()
-        default_input_index = default_info.get("index")
-    except (IOError, OSError, TypeError, ValueError, AttributeError):
-        pass
-
-    try:
-        device_count = int(audio.get_device_count())
-    except (IOError, OSError, TypeError, ValueError, AttributeError):
-        # MagicMock-based tests or misbehaving drivers can yield non-int counts.
-        return preferred_index
-
-    if device_count <= 0:
-        # No enumeration available; let PyAudio fall back to system default.
-        return preferred_index
-
-    for i in range(device_count):
-        try:
-            info = audio.get_device_info_by_index(i)
-        except (IOError, OSError, TypeError, ValueError, AttributeError):
-            continue
-
-        if not isinstance(info, dict):
-            # Non-dict result (e.g. MagicMock in tests) — can't filter by channels,
-            # so include the device rather than excluding all of them.
-            input_device_indices.append(i)
-            continue
-
-        device_name = info.get("name", "")
-        if _is_virtual_device(device_name):
-            logger.debug(f"Filtering virtual input device [{i}]: {device_name}")
-            continue
-
-        channels = info.get("maxInputChannels", 0)
-        if isinstance(channels, (int, float)) and channels > 0:
-            input_device_indices.append(i)
-
-    if not input_device_indices:
-        return None
-
-    if preferred_index is not None and preferred_index in input_device_indices:
-        return preferred_index
-
-    if preferred_index is not None:
-        try:
-            device_name = audio.get_device_info_by_index(preferred_index).get("name", "unknown")
-        except (IOError, OSError):
-            device_name = "unknown"
-        logger.warning(
-            "Configured audio device [%s] (%s) is not a safe input device. "
-            "Falling back to a valid input device.",
-            preferred_index,
-            device_name,
-        )
-
-    if default_input_index is not None and default_input_index in input_device_indices:
-        return default_input_index
-
-    return input_device_indices[0]
-
-
-def _open_capture_stream(audio, device_index: Optional[int] = None) -> tuple[int, int, object]:
-    """
-    Negotiate a working (channels, sample_rate) and return the opened stream.
-
-    Historically Vocalinux probed channels and sample rates separately, each
-    opening and closing PortAudio streams, then opened the real capture stream
-    on top — three open/close cycles in under a second. Bluetooth headset
-    capture (SCO/HFP / PipeWire "Bluetooth internal capture stream") is
-    especially sensitive to that pattern and can abort the process with malloc
-    heap corruption (see GitHub issue #567).
-
-    This function opens PortAudio exactly once per capture session: candidate
-    formats are tried in order (device default rate first, native channel count
-    first for 2–8ch devices, stereo skipped entirely for mono-only devices)
-    and the FIRST successfully opened stream is returned to the caller for
-    actual capture — never closed and reopened.
-
-    Args:
-        audio: PyAudio instance
-        device_index: The device index to open (None for default)
-
-    Returns:
-        Tuple of (channels, sample_rate, stream). If no format works, returns
-        (1, 16000, None) and the caller may attempt its own fallback open.
-    """
-    import pyaudio
-
-    FORMAT = pyaudio.paInt16
-    CHUNK = 1024
-    COMMON_RATES = [48000, 44100, 32000, 22050, 16000, 8000]
-
-    device_info = _get_device_info_safe(audio, device_index)
-    device_name = device_info.get("name")
-    rates_to_try: list[int] = []
-
-    default_rate = int(device_info.get("defaultSampleRate", 0) or 0)
-    if default_rate > 0:
-        rates_to_try.append(default_rate)
-        logger.debug(f"Device reports default sample rate: {default_rate}Hz")
-
-    for rate in COMMON_RATES:
-        if rate not in rates_to_try:
-            rates_to_try.append(rate)
-
-    # Never probe extra channels on a device that reports a single input
-    # channel (opening with more than supported is itself a known
-    # PortAudio/ALSA corruption trigger). Devices must be opened at their
-    # native layout first: Intel SOF DMICs often only support 2ch at the
-    # PCM (#666), and HDA analog mics commonly expose 4 capture channels
-    # even when only the first pair is a mic (#813). Opening below native
-    # channel count can succeed then abort in PortAudio CleanUpStream with
-    # ``free(): corrupted unsorted chunks``. Pulse virtual devices often
-    # report 32 or 128 channels; those are not native PCM layouts, so we
-    # still try 2ch then 1ch.
-    reported_channels = int(device_info.get("maxInputChannels", 0) or 0)
-    if reported_channels == 1:
-        channel_options = [1]
-    elif reported_channels == 2:
-        channel_options = [2, 1]
-    elif 2 < reported_channels <= 8:
-        channel_options = [reported_channels, 2, 1]  # HDA 4ch (#813)
-    elif reported_channels > 8:
-        channel_options = [2, 1]  # Pulse 32/128
-    else:
-        channel_options = [1, 2]
-
-    bluetooth = _is_bluetooth_device(device_name)
-    # Brief settle helps BlueZ/Pulse release SCO between failed open attempts.
-    settle_s = 0.15 if bluetooth else 0.0
-
-    for channels in channel_options:
-        for rate in rates_to_try:
-            stream = None
-            try:
-                stream_kwargs = {
-                    "format": FORMAT,
-                    "channels": channels,
-                    "rate": rate,
-                    "input": True,
-                    "frames_per_buffer": CHUNK,
-                }
-                if device_index is not None:
-                    stream_kwargs["input_device_index"] = device_index
-
-                stream = audio.open(**stream_kwargs)
-                logger.debug(f"Opened capture stream: {channels} channel(s) at {rate}Hz")
-                return channels, rate, stream
-            except (IOError, OSError) as e:
-                _safe_close_stream(stream)
-                error_str = str(e).lower()
-                if "invalid number of channels" in error_str or "-9998" in error_str:
-                    logger.debug(f"Device rejected {channels} channel(s) at {rate}Hz: {e}")
-                else:
-                    logger.debug(f"Capture open failed ({channels}ch @ {rate}Hz): {e}")
-                if settle_s:
-                    time.sleep(settle_s)
-
-    logger.warning("Could not open capture stream, defaulting to 1ch/16000Hz")
-    return 1, 16000, None
-
-
-# Mean-square energy floor on int16 PCM before locking the N>=3 sticky channel.
-# Capture samples are raw int16 (see _record_audio np.frombuffer(..., int16));
-# RMS ≈ 100 ≈ -50 dBFS — above idle dither/ambient, well below speech.
-_STICKY_LOCK_MIN_MEAN_SQUARE = 10_000.0
-
-
-def _downmix_to_mono(
-    audio_array: "np.ndarray",
-    channels: int,
-    sticky_channel: Optional[int] = None,
-) -> tuple["np.ndarray", Optional[int]]:
-    """Downmix interleaved int16 PCM to mono.
-
-    Speech recognition engines expect mono audio.
-
-    Stereo (2ch) still averages both channels. For 3+ channels, energy-aware
-    selection is required: the microphone may not be on ch0/ch1 (HDA analog
-    capture often puts it on ch2/ch3), so keeping only the first stereo pair
-    can yield silence, while averaging all N attenuates speech when only some
-    channels are live.
-
-    While sticky is unset, each buffer returns the loudest channel by
-    mean-square energy, but sticky is only *set* when that channel's
-    mean-square exceeds :data:`_STICKY_LOCK_MIN_MEAN_SQUARE` (speech-gated
-    lock). That avoids pinning an ambient/noise channel from a silent first
-    buffer before the mic speaks. Once sticky is set, later buffers reuse it
-    until cleared on open/reconnect/cleanup so a noise burst on another input
-    cannot switch the mic mid-utterance.
-
-    Args:
-        audio_array: 1-D int16 samples with interleaved channels.
-        channels: Number of interleaved channels in *audio_array*.
-        sticky_channel: Previously selected channel for N>=3 streams, or
-            ``None`` to (re)select by loudest mean-square energy.
-
-    Returns:
-        ``(mono, sticky)`` where *mono* is 1-D int16 samples and *sticky* is
-        the channel index to reuse on the next N>=3 buffer (``None`` for
-        N<=2, or when N>=3 and no speech-gated lock yet). ``channels <= 1``
-        is a passthrough. If ``len(audio_array)`` is not divisible by
-        *channels*, leftover samples are truncated using the full N-channel
-        frame width before reshape; an empty array after truncation is
-        returned as-is (sticky unchanged for N>=3 when already set, else
-        ``None``). Stereo averages both channels; N>=3 uses the sticky index
-        when in range, otherwise the loudest channel by per-buffer
-        mean-square (ties keep the first index), locking sticky only when
-        that channel clears the non-silence energy floor.
-    """
-    if channels <= 1:
-        return audio_array, None
-    leftover = len(audio_array) % channels
-    if leftover:
-        audio_array = audio_array[: len(audio_array) - leftover]
-    if len(audio_array) == 0:
-        if channels >= 3 and sticky_channel is not None and 0 <= sticky_channel < channels:
-            return audio_array, sticky_channel
-        return audio_array, None
-    frames = audio_array.reshape(-1, channels)
-    if channels == 2:
-        return frames.mean(axis=1).astype(audio_array.dtype), None
-    if sticky_channel is not None and 0 <= sticky_channel < channels:
-        selected = int(sticky_channel)
-        return frames[:, selected].astype(audio_array.dtype), selected
-    # Cast before squaring so int16 does not overflow.
-    energy = (frames.astype("float64") ** 2).mean(axis=0)
-    selected = int(energy.argmax())
-    mono = frames[:, selected].astype(audio_array.dtype)
-    # Speech-gate: return loudest mono now, but only pin sticky on real energy.
-    if float(energy[selected]) >= _STICKY_LOCK_MIN_MEAN_SQUARE:
-        return mono, selected
-    return mono, None
-
-
-def _get_supported_channels(audio, device_index: Optional[int] = None) -> int:
-    """
-    Detect the supported number of channels for the audio device.
-
-    Production code should use :func:`_open_capture_stream`, which keeps the
-    negotiated stream open instead of closing and reopening it. This helper is
-    retained for standalone format queries.
-
-    Args:
-        audio: PyAudio instance
-        device_index: The device index to test (None for default)
-
-    Returns:
-        int: Negotiated channel count (1, 2, or native 3–8 for HDA),
-        defaults to 1
-    """
-    channels, _rate, stream = _open_capture_stream(audio, device_index)
-    _safe_close_stream(stream)
-    return channels
-
-
-def _get_supported_sample_rate(audio, device_index: Optional[int], channels: int = 1) -> int:
-    """
-    Get a supported sample rate for the audio device.
-
-    Some audio devices (like Vocaster One) only support specific sample rates
-    (e.g., 48kHz) and will fail with the default 16kHz. This function tests
-    common sample rates and returns the highest supported one.
-
-    Production code should use :func:`_open_capture_stream`, which negotiates
-    channels and rate with a single PortAudio open. This helper is retained
-    for standalone format queries.
-
-    Args:
-        audio: PyAudio instance
-        device_index: The device index to test
-        channels: Number of channels (default 1)
-
-    Returns:
-        int: A supported sample rate, defaulting to 16000 if none work
-    """
-    import pyaudio
-
-    FORMAT = pyaudio.paInt16
-    CHUNK = 1024
-
-    # Common sample rates to try, ordered from highest to lowest quality
-    COMMON_RATES = [48000, 44100, 32000, 22050, 16000, 8000]
-
-    device_info = _get_device_info_safe(audio, device_index)
-    device_name = device_info.get("name")
-    bluetooth = _is_bluetooth_device(device_name)
-    settle_s = 0.15 if bluetooth else 0.0
-
-    rates_to_try: list[int] = []
-    default_rate = int(device_info.get("defaultSampleRate", 0) or 0)
-    if default_rate > 0:
-        rates_to_try.append(default_rate)
-    for rate in COMMON_RATES:
-        if rate not in rates_to_try:
-            rates_to_try.append(rate)
-
-    for rate in rates_to_try:
-        test_stream = None
-        try:
-            stream_kwargs = {
-                "format": FORMAT,
-                "channels": channels,
-                "rate": rate,
-                "input": True,
-                "frames_per_buffer": CHUNK,
-            }
-            if device_index is not None:
-                stream_kwargs["input_device_index"] = device_index
-
-            test_stream = audio.open(**stream_kwargs)
-            _safe_close_stream(test_stream)
-            test_stream = None
-            logger.debug(f"Found supported sample rate: {rate}Hz")
-            return rate
-        except (IOError, OSError):
-            if settle_s:
-                time.sleep(settle_s)
-        finally:
-            _safe_close_stream(test_stream)
-
-    # Fallback to 16kHz if nothing works
-    logger.warning("Could not find supported sample rate, defaulting to 16000Hz")
-    return 16000
-
-
-def test_audio_input(device_index: int = None, duration: float = 1.0) -> dict:
-    """
-    Test audio input from a device and return diagnostic information.
-
-    Args:
-        device_index: The device index to test (None for default)
-        duration: How long to record in seconds
-
-    Returns:
-        Dictionary with test results including:
-        - success: bool
-        - device_name: str
-        - sample_count: int
-        - max_amplitude: float
-        - mean_amplitude: float
-        - has_signal: bool (amplitude above noise floor)
-        - error: str (if failed)
-    """
-    result = {
-        "success": False,
-        "device_name": "Unknown",
-        "device_index": device_index,
-        "sample_count": 0,
-        "max_amplitude": 0.0,
-        "mean_amplitude": 0.0,
-        "has_signal": False,
-        "error": None,
-    }
-
-    try:
-        import numpy as np
-        import pyaudio
-
-        CHUNK = 1024
-        FORMAT = pyaudio.paInt16
-
-        audio = pyaudio.PyAudio()
-
-        # Get device info for display. Keep open_device_index as None for
-        # System Default so PortAudio opens the host default instead of an
-        # explicit pseudo-device index like "default" / DeepFilterNet (#624).
-        open_device_index = device_index
-        try:
-            if device_index is not None:
-                info = audio.get_device_info_by_index(device_index)
-            else:
-                info = audio.get_default_input_device_info()
-            result["device_name"] = info.get("name", "Unknown")
-            result["device_index"] = info.get("index", device_index)
-        except (IOError, OSError) as e:
-            result["error"] = f"Cannot get device info: {e}"
-            audio.terminate()
-            return result
-
-        # Negotiate the format and open the capture stream in ONE PortAudio
-        # open — Bluetooth SCO devices abort with heap corruption when the
-        # stream is opened, closed, and quickly reopened (issue #567).
-        CHANNELS, RATE, stream = _open_capture_stream(audio, open_device_index)
-        logger.info(f"Using {CHANNELS} channel(s) for audio test")
-        result["sample_rate"] = RATE
-
-        if stream is None:
-            # Negotiation failed; try one last plain open so the error
-            # message reflects the real failure.
-            try:
-                stream_kwargs = {
-                    "format": FORMAT,
-                    "channels": CHANNELS,
-                    "rate": RATE,
-                    "input": True,
-                    "frames_per_buffer": CHUNK,
-                }
-                if open_device_index is not None:
-                    stream_kwargs["input_device_index"] = open_device_index
-
-                stream = audio.open(**stream_kwargs)
-            except (IOError, OSError) as e:
-                result["error"] = f"Cannot open audio stream: {e}"
-                audio.terminate()
-                return result
-
-        # Record and analyze
-        all_amplitudes = []
-        frames_to_read = int(RATE * duration / CHUNK)
-
-        for _ in range(frames_to_read):
-            try:
-                data = stream.read(CHUNK, exception_on_overflow=False)
-                audio_data = np.frombuffer(data, dtype=np.int16)
-                amplitudes = np.abs(audio_data)
-                all_amplitudes.extend(amplitudes)
-            except (OSError, ValueError) as e:
-                result["error"] = f"Error reading audio: {e}"
-                break
-
-        _safe_close_stream(stream)
-        audio.terminate()
-
-        if all_amplitudes:
-            all_amplitudes = np.array(all_amplitudes)
-            result["success"] = True
-            result["sample_count"] = len(all_amplitudes)
-            result["max_amplitude"] = float(np.max(all_amplitudes))
-            result["mean_amplitude"] = float(np.mean(all_amplitudes))
-            # Signal present if max amplitude is above typical digital noise floor
-            # 16-bit audio has max value of 32768, noise floor is typically < 100
-            result["has_signal"] = result["max_amplitude"] > 200
-
-    except ImportError as e:
-        result["error"] = f"Missing dependency: {e}"
-    except (OSError, ValueError, RuntimeError) as e:
-        result["error"] = f"Unexpected error: {e}"
-
-    return result
+        resolved = language_for_active_layout(SUPPORTED_LANGUAGES)
+    except (
+        OSError,
+        FileNotFoundError,
+        subprocess.SubprocessError,
+        ValueError,
+        TypeError,
+        KeyError,
+        AttributeError,
+    ) as exc:
+        logger.debug(f"Keyboard layout lookup failed: {exc}")
+        return "auto"
+
+    return resolved or "auto"
 
 
 logger = logging.getLogger(__name__)
@@ -1037,6 +341,12 @@ def _get_system_model_paths() -> list:
 # Alternative locations for pre-installed models (now dynamic)
 SYSTEM_MODELS_DIRS = _get_system_model_paths()
 
+# vosk.Model()'s peak RSS during loading runs well above the model's on-disk
+# size (issue #676: an RNNLM-bearing model's load-time spike was ~1.5-2x its
+# file size). Require this multiple of available memory before attempting
+# the load.
+_VOSK_MODEL_MEMORY_SAFETY_MARGIN = 2.0
+
 
 def detect_pywhispercpp_gpu_backend() -> str:
     """Detect whether pywhispercpp's native library actually has GPU support."""
@@ -1081,8 +391,24 @@ class SpeechRecognitionManager:
         """
         self.engine = engine
         self.model_size = model_size
-        self.language = normalize_language_for_engine(engine, language)
+        # The stored preference, which may be the "layout" sentinel. self.language
+        # is always something an engine can consume, re-resolved from this at the
+        # start of every dictation while the sentinel is in force (#821).
+        self.language_preference = language
+        self.language = normalize_language_for_engine(engine, resolve_language_preference(language))
+        # One-shot language override set by a per-language shortcut (#805):
+        # consumed by the next start attempt, restored when dictation ends.
+        self._pending_language_override: Optional[str] = None
+        self._oneshot_language_restore: Optional[str] = None
+        # The language the in-flight dictation session resolves to. Workers
+        # read this so a one-shot restore during a lingering transcribe cannot
+        # change a queued segment's language (#805).
+        self._session_language: Optional[str] = None
         self.stop_sound_guard_ms = kwargs.get("stop_sound_guard_ms", 200)
+        self.dictionary_manager: Optional["CustomDictionaryManager"] = kwargs.get(
+            "dictionary_manager"
+        )
+        self._vosk_dictionary_warned = False
         self.state = RecognitionState.IDLE
         self.audio_thread = None
         self.recognition_thread = None
@@ -1095,6 +421,16 @@ class SpeechRecognitionManager:
         self._voice_commands_enabled = self._resolve_voice_commands_enabled()
 
         self.text_callbacks: list[Callable[[str], None]] = []
+        # (text, capture-started_at) consumers, e.g. transcription history.
+        self.segment_callbacks: list[Callable[[str, float], None]] = []
+        # While the Settings microphone test runs, segments whose capture
+        # began at or after this monotonic time are test speech; consumers
+        # (e.g. history) read the floor to skip them. When the test ends the
+        # ceiling closes the window — segments captured during it but still
+        # decoding must keep failing the check, so the floor alone is never
+        # lifted back to None.
+        self.test_capture_floor: Optional[float] = None
+        self.test_capture_ceiling: Optional[float] = None
         self.state_callbacks: list[Callable[[RecognitionState], None]] = []
         self.action_callbacks: list[Callable[[str], None]] = []
 
@@ -1107,12 +443,22 @@ class SpeechRecognitionManager:
         # dialog both download in the background, and there is only one progress
         # callback and one engine configuration between them.
         self._download_claim = threading.Lock()
+        # Opener threads _stream_model_download leaves running past a cancel;
+        # each is bounded by the network timeout but tracked so repeated
+        # cancel-and-retry cannot stack unaccounted request threads.
+        self._download_openers: set[threading.Thread] = set()
         self._defer_download = defer_download
         self._model_initialized = False
         # True while auto-pause has unloaded the model for a configured app/game
         self._auto_paused = False
         # True while idle keep-alive has unloaded the model (dictation may lazy-reload)
         self._idle_unloaded = False
+        self.buffer_during_reload = bool(kwargs.get("buffer_during_reload", False))
+        self._buffered_reload_session = False
+        self._reload_pending = False
+        self._buffered_capture_failed = False
+        self._capture_finished = threading.Event()
+        self._cancel_buffered_session = threading.Event()
 
         # Speech detection parameters (load defaults, will be overridden by configure)
         self.vad_sensitivity = kwargs.get("vad_sensitivity", 3)
@@ -1133,6 +479,9 @@ class SpeechRecognitionManager:
         self.whispercpp_no_timestamps = kwargs.get("whispercpp_no_timestamps", True)
         self.whispercpp_no_context = kwargs.get("whispercpp_no_context", True)
         self.whispercpp_initial_prompt = kwargs.get("whispercpp_initial_prompt", "")
+        self.whispercpp_language_candidates = self._normalize_language_candidates(
+            kwargs.get("whispercpp_language_candidates", "")
+        )
         self.whispercpp_temperature = kwargs.get("whispercpp_temperature", 0.0)
         self.whispercpp_temperature_inc = kwargs.get("whispercpp_temperature_inc", -1.0)
         self.whispercpp_entropy_thold = kwargs.get("whispercpp_entropy_thold", 2.4)
@@ -1158,6 +507,9 @@ class SpeechRecognitionManager:
         self.should_record = False
         self._recognition_mode = "toggle"  # "toggle" or "push_to_talk"
         self.audio_buffer = []
+        # Monotonic time the current buffer's first chunk was captured,
+        # propagated onto each enqueued _AudioSegment.
+        self._segment_started_at: Optional[float] = None
         self._recording_segment_has_speech = False
         self._buffer_lock = threading.Lock()  # Thread safety for audio_buffer
         self._model_lock = threading.Lock()  # Thread safety for model/recognizer access
@@ -1174,6 +526,18 @@ class SpeechRecognitionManager:
         self._capture_sample_rate = 16000  # Default, updated when device is opened
         self._capture_channels = 1  # Default, updated when device is opened
         self._capture_downmix_channel = None  # Speech-gated sticky N>=3 channel for open stream
+        # The active capture source while a recording session is open.
+        self._capture_source: Optional[Union[PortAudioCaptureSource, PipeWireCaptureSource]] = None
+
+        # Recover a sink left quiet by a crash before doing anything slow.
+        # Tests inject a session so this never touches a real audio server.
+        injected_duck = kwargs.get("playback_duck")
+        self._playback_duck = (
+            default_dictation_duck_session() if injected_duck is None else injected_duck
+        )
+        # Serializes arm vs release: a failure path that already released the
+        # duck must not be followed by an arm that re-lowers the sink.
+        self._playback_duck_lock = threading.Lock()
 
         # Create models directory if it doesn't exist
         os.makedirs(MODELS_DIR, exist_ok=True)
@@ -1198,6 +562,23 @@ class SpeechRecognitionManager:
         else:
             raise ValueError(f"Unsupported speech recognition engine: {engine}")
 
+    @staticmethod
+    def _normalize_language_candidates(value: str | list[str] | None) -> list[str]:
+        """Normalize a comma-separated string or list of Whisper language codes."""
+        if value is None:
+            return []
+
+        raw_candidates = value.replace(";", ",").split(",") if isinstance(value, str) else value
+        candidates = []
+        for candidate in raw_candidates:
+            code = str(candidate).strip().lower().replace("_", "-")
+            if not code:
+                continue
+            code = code.split("-", 1)[0]
+            if code not in candidates:
+                candidates.append(code)
+        return candidates
+
     def _resolve_voice_commands_enabled(self) -> bool:
         """Resolve effective voice commands state from preference and engine."""
         if self._voice_commands_preference is None:
@@ -1221,6 +602,22 @@ class SpeechRecognitionManager:
         else:
             raise ValueError(f"Unsupported speech recognition engine: {self.engine}")
 
+    #: Class-level default so a manager built without ``__init__`` still answers
+    #: "not following the layout" instead of raising on the dictation path.
+    language_preference: str = "auto"
+
+    #: Same for the one-shot override state (#805): __new__-built stubs in tests
+    #: must not raise on the dictation path either.
+    language: str = "auto"
+    _pending_language_override: Optional[str] = None
+    _oneshot_language_restore: Optional[str] = None
+    _session_language: Optional[str] = None
+
+    #: Logged once rather than per dictation, so an unsupported pairing does not
+    #: spam the log on every hotkey press.
+    _warned_follow_layout_unsupported: bool = False
+    _warned_language_override_unsupported: bool = False
+
     # Every live field ``reconfigure()`` can write. A failed engine switch
     # restores this set so dictation matches the persisted config, not the
     # attempted-but-unsaved Settings values.
@@ -1228,6 +625,8 @@ class SpeechRecognitionManager:
         "engine",
         "model_size",
         "language",
+        "language_preference",
+        "_oneshot_language_restore",
         "vad_sensitivity",
         "silence_timeout",
         "audio_device_index",
@@ -1238,6 +637,7 @@ class SpeechRecognitionManager:
         "whispercpp_no_timestamps",
         "whispercpp_no_context",
         "whispercpp_initial_prompt",
+        "whispercpp_language_candidates",
         "whispercpp_temperature",
         "whispercpp_temperature_inc",
         "whispercpp_entropy_thold",
@@ -1259,6 +659,222 @@ class SpeechRecognitionManager:
         """Write a ``_snapshot_reconfigure_state`` result back onto the manager."""
         for name, value in previous.items():
             setattr(self, name, value)
+
+    #: Engines that read the language per utterance instead of baking it into the
+    #: loaded model, so changing it costs nothing.
+    _PER_UTTERANCE_LANGUAGE_ENGINES = ("whisper", "whisper_cpp", "faster_whisper", "remote_api")
+
+    def _can_relanguage_without_reload(self) -> bool:
+        """Whether a language change can skip re-initialising the engine (#821).
+
+        The whisper family passes the language to each transcribe call, so the
+        loaded model does not care. VOSK loads a different model per language and
+        Parakeet never consumes a catalog language at all, so both keep the
+        restart. An English-only whisper model is excluded as well: it cannot
+        honour a non-English layout, and only a reload can fetch one that can.
+        """
+        if self.engine not in self._PER_UTTERANCE_LANGUAGE_ENGINES:
+            return False
+        if self.engine == "remote_api":
+            # The language rides along in the request body; nothing is loaded here.
+            return True
+        return not is_english_only_model(self.model_size)
+
+    def _refresh_language_from_layout(self) -> None:
+        """Re-point the engine at the active keyboard layout before dictating.
+
+        A no-op unless the user asked for the follow mode. Failures are logged
+        and swallowed: dictating in the previous language beats not dictating.
+        """
+        if self.language_preference != LANGUAGE_FOLLOWS_LAYOUT:
+            return
+
+        target = normalize_language_for_engine(
+            self.engine, resolve_language_preference(LANGUAGE_FOLLOWS_LAYOUT)
+        )
+        if target == self.language:
+            return
+
+        if self._can_relanguage_without_reload():
+            logger.info(f"Keyboard layout changed: dictating in {target}")
+            self.language = target
+            self.command_processor.set_language(target)
+            if self._faster_whisper_engine is not None:
+                # Read per utterance by the engine's own _normalize_language.
+                self._faster_whisper_engine.language = target
+            return
+
+        # English-only whisper.cpp weights cannot honour a non-English layout.
+        # Swap to the multilingual sibling and keep the follow-mode sentinel;
+        # handing ``target`` to reconfigure() would store it as the new
+        # preference and disarm the mode after a single switch.
+        # is_model_downloaded / _multilingual_sibling are the whisper.cpp
+        # catalog: do not consult them for whisper / faster_whisper .en ids.
+        if self.engine == "whisper_cpp":
+            sibling = _multilingual_sibling(self.model_size)
+            # No surprise fetch on the hotkey: only swap if the sibling is already downloaded.
+            if sibling != self.model_size and is_model_downloaded(sibling):
+                try:
+                    self.reconfigure(model_size=sibling, language=LANGUAGE_FOLLOWS_LAYOUT)
+                    return
+                except (
+                    RuntimeError,
+                    ValueError,
+                    FileNotFoundError,
+                    OSError,
+                    ImportError,
+                    TypeError,
+                    AttributeError,
+                    ChecksumError,
+                ):
+                    logger.error(
+                        "Failed to swap to multilingual sibling %r for layout "
+                        "language %s (engine=%s, model=%s)",
+                        sibling,
+                        target,
+                        self.engine,
+                        self.model_size,
+                        exc_info=True,
+                    )
+
+        if not self._warned_follow_layout_unsupported:
+            self._warned_follow_layout_unsupported = True
+            logger.warning(
+                f"Cannot follow the keyboard layout to {target}: the loaded "
+                f"{self.model_size!r} model cannot transcribe it. Pick a "
+                "multilingual model in Settings to use this mode."
+            )
+
+    def _dictation_language(self, segment_language: Optional[str] = None) -> str:
+        """The language a queued audio segment was recorded under (#805).
+
+        A transcription worker can outlive ``stop_recognition``'s timed joins,
+        so ``self.language`` may already be restored to the configured value
+        while a queued segment still needs the one-shot override — and a newer
+        dictation may already have overwritten ``_session_language`` by the
+        time a stale worker reads it. Queued segments therefore carry a
+        ``segment_language`` snapshot stamped at enqueue time; calls without
+        one (tests and direct transcribe calls) fall back to the session
+        binding, then the configured language.
+        """
+        if segment_language is not None:
+            return segment_language
+        return self._session_language or self.language
+
+    def _refuse_language_override(self, language: str) -> None:
+        """Play the refusal cue for a per-language shortcut the model can't serve."""
+        if not self._warned_language_override_unsupported:
+            self._warned_language_override_unsupported = True
+            logger.warning(
+                f"Cannot dictate in {language!r}: the loaded "
+                f"{self.engine}/{self.model_size!r} model cannot transcribe "
+                "it without a reload. Pick a multilingual model in Settings "
+                "or switch the dictation language instead."
+            )
+        play_error_sound()
+        _show_notification(
+            "Language Shortcut Unavailable",
+            f"Vocalinux cannot dictate in {language} with the loaded model. "
+            "Choose a multilingual model in Settings to use this shortcut.",
+            "dialog-warning",
+        )
+
+    def _serving_model_supports_language_switch(self) -> bool:
+        """Whether the model that will serve this utterance can switch language.
+
+        ``start_recognition`` refreshes the layout before a shortcut's override
+        applies, and on follow-keyboard-layout that refresh can swap an
+        English-only whisper.cpp model for a downloaded multilingual sibling.
+        Judge the model the refresh leaves loaded, not the one in memory now.
+        """
+        if self._can_relanguage_without_reload():
+            return True
+        if self.engine == "whisper_cpp" and self.language_preference == LANGUAGE_FOLLOWS_LAYOUT:
+            sibling = _multilingual_sibling(self.model_size)
+            if sibling != self.model_size and is_model_downloaded(sibling):
+                return True
+        return False
+
+    def _apply_pending_language_override(self) -> bool:
+        """Point this utterance at a per-language shortcut's language (#805).
+
+        Consumed once, right after the layout refresh, so the explicit shortcut
+        wins over the follow-mode resolution *and* the capability check runs
+        against the model that will actually transcribe. The previous effective
+        language is kept in ``_oneshot_language_restore`` and put back by
+        ``_restore_language_after_oneshot`` once dictation ends.
+
+        Returns False — refusing to start — when the engine drops the request
+        (Parakeet normalizes every catalog language to ``auto``, so a labeled
+        shortcut could never select it) or the loaded model cannot transcribe
+        it without a reload; dictating silently in the wrong language would be
+        worse than playing the refusal cue.
+        """
+        requested = self._pending_language_override
+        if requested is None:
+            return True
+        target = normalize_language_for_engine(self.engine, requested)
+        if target != requested:
+            self._refuse_language_override(requested)
+            return False
+        if target == self.language:
+            return True
+        if not self._can_relanguage_without_reload():
+            self._refuse_language_override(requested)
+            return False
+        self._oneshot_language_restore = self.language
+        self.language = target
+        self.command_processor.set_language(target)
+        if self._faster_whisper_engine is not None:
+            self._faster_whisper_engine.language = target
+        logger.debug(f"Dictating in {target} via per-language shortcut")
+        return True
+
+    def _restore_language_after_oneshot(self) -> None:
+        """Undo a per-language shortcut's one-shot override (#805).
+
+        Runs when dictation drops to IDLE or ERROR, so the next plain hotkey
+        dictation resolves the configured language again.
+        """
+        previous = self._oneshot_language_restore
+        if previous is None:
+            return
+        self._oneshot_language_restore = None
+        self.language = previous
+        self.command_processor.set_language(previous)
+        if self._faster_whisper_engine is not None:
+            self._faster_whisper_engine.language = previous
+        logger.debug(f"Restored dictation language {previous} after one-shot")
+
+    def _get_dictionary_prompt(self) -> Optional[str]:
+        """Return a live custom-terms prompt without interrupting dictation on errors."""
+        if self.dictionary_manager is None:
+            return None
+        try:
+            return self.dictionary_manager.build_initial_prompt()
+        except (OSError, TypeError, ValueError) as error:
+            logger.warning("Could not build custom terms prompt: %s", error)
+            return None
+
+    def _get_whispercpp_prompt(self) -> Optional[str]:
+        """Combine the Advanced prompt with the live custom terms prompt.
+
+        The explicit Advanced prompt remains first and custom terms are appended,
+        so enabling custom dictionary support never discards user configuration.
+        """
+        parts = [self.whispercpp_initial_prompt.strip(), self._get_dictionary_prompt() or ""]
+        prompt = " ".join(part for part in parts if part)
+        return prompt or None
+
+    def _apply_dictionary_corrections(self, text: str) -> str:
+        """Apply live corrections before voice-command interpretation."""
+        if self.dictionary_manager is None:
+            return text
+        try:
+            return self.dictionary_manager.apply_corrections(text)
+        except (OSError, TypeError, ValueError) as error:
+            logger.warning("Could not apply custom dictionary corrections: %s", error)
+            return text
 
     def _init_vosk(self):
         """Initialize the VOSK speech recognition engine."""
@@ -1297,6 +913,8 @@ class SpeechRecognitionManager:
                 else:
                     logger.info(f"Using existing VOSK model from {self.vosk_model_path}")
 
+            self._check_vosk_model_memory(self.vosk_model_path)
+
             logger.info(f"Loading VOSK model from {self.vosk_model_path}")
             # Ensure previous model/recognizer are released if re-initializing
             self.model = None
@@ -1305,11 +923,70 @@ class SpeechRecognitionManager:
             self.recognizer = KaldiRecognizer(self.model, 16000)
             self._model_initialized = True
             logger.info("VOSK engine initialized successfully.")
+            if (
+                self.dictionary_manager is not None
+                and self.dictionary_manager.terms_enabled()
+                and not self._vosk_dictionary_warned
+            ):
+                self._vosk_dictionary_warned = True
+                logger.warning(
+                    "Custom terms are ignored by VOSK; transcript corrections still apply."
+                )
 
         except ImportError:
             logger.error("Failed to import VOSK. Please install it with 'pip install vosk'")
             self.state = RecognitionState.ERROR
             raise
+
+    @staticmethod
+    def _vosk_model_size_bytes(model_path: str) -> int:
+        """Sum on-disk file sizes under a VOSK model directory.
+
+        Walks the whole directory rather than reading a catalog size, since
+        the RNNLM component (rnnlm/final.raw) that drives the memory spike
+        this guards against is only present for some languages/models and
+        is not reflected in VOSK_MODEL_INFO's nominal download size.
+        """
+        total = 0
+        for root, _dirs, files in os.walk(model_path):
+            for name in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, name))
+                except OSError:
+                    continue
+        return total
+
+    def _check_vosk_model_memory(self, model_path: str) -> None:
+        """Refuse to load a VOSK model that would exhaust available memory.
+
+        vosk.Model() allocates the whole model (acoustic model plus, for
+        models that ship one, the RNNLM rescoring component) in one spike
+        during loading. There is no way to load it incrementally or query
+        vosk for how much it will need up front, so the only guard
+        available here is comparing the model's on-disk footprint against
+        currently available memory before calling into the native loader
+        (issue #676: this spike killed the process via the kernel OOM
+        killer on a 16GB machine, with no exception Vocalinux could catch).
+        """
+        import psutil
+
+        model_bytes = self._vosk_model_size_bytes(model_path)
+        if model_bytes <= 0:
+            return
+
+        available_bytes = psutil.virtual_memory().available
+        required_bytes = model_bytes * _VOSK_MODEL_MEMORY_SAFETY_MARGIN
+
+        if available_bytes < required_bytes:
+            model_mb = model_bytes / (1024 * 1024)
+            available_mb = available_bytes / (1024 * 1024)
+            raise RuntimeError(
+                f"Not enough memory to load the VOSK model at {model_path} "
+                f"(model is ~{model_mb:.0f}MB on disk, {available_mb:.0f}MB "
+                "available). Loading it would likely be killed by the "
+                "system's out-of-memory killer partway through. Close other "
+                "applications or switch to a smaller model size in Settings."
+            )
 
     def _init_whisper(self):
         """Initialize the Whisper speech recognition engine."""
@@ -1383,12 +1060,16 @@ class SpeechRecognitionManager:
             self.state = RecognitionState.ERROR
             raise
 
-    def _transcribe_with_whisper(self, audio_buffer: list[bytes]) -> str:
+    def _transcribe_with_whisper(
+        self, audio_buffer: list[bytes], language: Optional[str] = None
+    ) -> str:
         """
         Transcribe audio buffer using Whisper.
 
         Args:
             audio_buffer: List of audio data chunks (16-bit PCM at 16kHz)
+            language: Per-utterance snapshot stamped on the queued segment
+                (#805); None resolves the live session language.
 
         Returns:
             Transcribed text
@@ -1423,7 +1104,7 @@ class SpeechRecognitionManager:
                     import torch
                 use_fp16 = self.model.device != torch.device("cpu")
 
-                lang = resolve_whisper_language(self.language)
+                lang = resolve_whisper_language(self._dictation_language(language))
 
                 # Transcribe with Whisper (handles variable length audio automatically)
                 result = self.model.transcribe(
@@ -1434,6 +1115,7 @@ class SpeechRecognitionManager:
                     temperature=0.0,  # Greedy decoding for consistency
                     no_speech_threshold=0.6,
                     fp16=use_fp16,  # Explicitly set to avoid warning on CPU
+                    initial_prompt=self._get_dictionary_prompt(),
                 )
 
             text = result.get("text", "").strip()
@@ -1635,12 +1317,16 @@ class SpeechRecognitionManager:
             self.state = RecognitionState.ERROR
             raise
 
-    def _transcribe_with_faster_whisper(self, audio_buffer: list[bytes]) -> str:
+    def _transcribe_with_faster_whisper(
+        self, audio_buffer: list[bytes], language: Optional[str] = None
+    ) -> str:
         """
         Transcribe audio buffer using faster-whisper.
 
         Args:
             audio_buffer: List of audio data chunks (16-bit PCM at 16kHz)
+            language: Per-utterance snapshot stamped on the queued segment
+                (#805); None resolves the live session language.
 
         Returns:
             Transcribed text
@@ -1650,7 +1336,11 @@ class SpeechRecognitionManager:
                 logger.warning("faster-whisper engine not ready during transcription")
                 return ""
 
-            return self._faster_whisper_engine.transcribe(audio_buffer)
+            return self._faster_whisper_engine.transcribe(
+                audio_buffer,
+                language=self._dictation_language(language),
+                initial_prompt=self._get_dictionary_prompt(),
+            )
         except (RuntimeError, OSError, ValueError) as e:
             logger.error(f"Error in faster-whisper transcription: {e}", exc_info=True)
             return ""
@@ -1661,8 +1351,12 @@ class SpeechRecognitionManager:
             _preload_pywhispercpp_shared_libraries()
             from pywhispercpp.model import Model  # noqa: F401 — fail fast if missing
 
-            # Validate model size for whisper.cpp
-            valid_models = list(WHISPERCPP_MODEL_INFO.keys())
+            # Validate model size for whisper.cpp. Non-dictation entries in the
+            # catalog (e.g. TinyDiarize) stay selectable for their own surfaces
+            # but emit markup that would inject noise into the focused window.
+            valid_models = [
+                name for name in WHISPERCPP_MODEL_INFO if name not in NON_DICTATION_MODELS
+            ]
             if self.model_size not in valid_models:
                 logger.warning(
                     f"Model size '{self.model_size}' not valid for whisper.cpp. "
@@ -1701,6 +1395,11 @@ class SpeechRecognitionManager:
                     logger.info(f"Downloading whisper.cpp '{self.model_size}' model...")
                     self._download_whispercpp_model()
 
+            # Backend detection plus the load itself run after the download
+            # reports "Complete!", so a UI watching the download needs to hear
+            # that this is still going. No callback is set outside that flow.
+            if self._download_progress_callback:
+                self._download_progress_callback(1.0, 0, "Loading model...")
             self._load_whispercpp_model(model_path)
 
         except ImportError as e:
@@ -2047,7 +1746,9 @@ class SpeechRecognitionManager:
         logger.info("Successfully loaded model with CPU backend")
         return cpu_backend
 
-    def _transcribe_with_whispercpp(self, audio_buffer: list[bytes]) -> str:
+    def _transcribe_with_whispercpp(
+        self, audio_buffer: list[bytes], language: Optional[str] = None
+    ) -> str:
         """
         Transcribe audio buffer using whisper.cpp.
 
@@ -2078,7 +1779,7 @@ class SpeechRecognitionManager:
             )
 
             # Prepare language parameter
-            lang = resolve_whisper_language(self.language)
+            lang = resolve_whisper_language(self._dictation_language(language))
 
             logger.debug(f"whisper.cpp using language: {lang or 'auto-detect'}")
 
@@ -2091,10 +1792,57 @@ class SpeechRecognitionManager:
                     logger.warning("Model is None during transcription, returning empty result")
                     return ""
 
+                if lang is None and self.whispercpp_language_candidates:
+                    detected, lang_probs = self.model.auto_detect_language(
+                        audio_float,
+                        n_threads=min(4, max(1, os.cpu_count() or 1)),
+                    )
+                    # lang_probs names every language whisper.cpp can return; a
+                    # configured code missing from it (a typo, or "auto") has no
+                    # real probability and must not win the max() below.
+                    candidate_probs = {
+                        candidate: float(lang_probs[candidate])
+                        for candidate in self.whispercpp_language_candidates
+                        if candidate in lang_probs
+                    }
+                    unsupported = [
+                        candidate
+                        for candidate in self.whispercpp_language_candidates
+                        if candidate not in lang_probs
+                    ]
+                    if unsupported:
+                        logger.warning(
+                            "Ignoring unsupported whisper.cpp language candidates: %s",
+                            ",".join(unsupported),
+                        )
+                    if candidate_probs:
+                        lang = max(candidate_probs, key=candidate_probs.get)
+                        logger.info(
+                            "whisper.cpp restricted language detection: detected=%s %.3f, candidates=%s, using=%s %.3f",
+                            detected[0],
+                            float(detected[1]),
+                            ",".join(candidate_probs.keys()),
+                            lang,
+                            candidate_probs[lang],
+                        )
+                    else:
+                        # Every configured candidate was unusable; keep the
+                        # unrestricted detection rather than forcing a code the
+                        # model never scored.
+                        lang = detected[0]
+                        logger.warning(
+                            "No usable whisper.cpp language candidates configured; using detected language %s",
+                            lang,
+                        )
+
                 # Transcribe with whisper.cpp
                 # pywhispercpp expects audio as numpy array
                 transcribe_start = time.time()
-                segments = self.model.transcribe(audio_float, language=lang)
+                transcribe_kwargs = {"language": lang}
+                # pywhispercpp reuses native parameter state.  Passing an empty
+                # value explicitly clears a prompt that was active last segment.
+                transcribe_kwargs["initial_prompt"] = self._get_whispercpp_prompt() or ""
+                segments = self.model.transcribe(audio_float, **transcribe_kwargs)
                 transcribe_duration = time.time() - transcribe_start
 
             # Extract text from segments, filtering non-speech tokens
@@ -2146,7 +1894,7 @@ class SpeechRecognitionManager:
         # its own slice of the bundle: the bar advances once across the whole
         # download instead of restarting for each of the four files.
         outer_callback = self._download_progress_callback
-        total_files = len(parakeet.MODEL_FILES)
+        total_files = len(parakeet.model_files(self.model_size))
 
         def file_progress(index: int, name: str) -> Callable[[float, float, str], None]:
             def report(fraction: float, speed: float, status: str) -> None:
@@ -2161,7 +1909,7 @@ class SpeechRecognitionManager:
 
         temp_file = None
         try:
-            for index, filename in enumerate(parakeet.MODEL_FILES):
+            for index, filename in enumerate(parakeet.model_files(self.model_size)):
                 dest_path = os.path.join(model_dir, filename)
                 key = parakeet.manifest_key(self.model_size, filename)
                 # Existence is not enough: a leftover or copied-in file must
@@ -2200,6 +1948,8 @@ class SpeechRecognitionManager:
                 os.rename(temp_file, dest_path)
                 temp_file = None
 
+            self._validate_parakeet_release_manifest(self.model_size, model_dir)
+
         # RequestException=Exception under the test mocks; do not catch
         # Timeout separately (it is not a real exception type there).
         except requests.exceptions.RequestException as e:
@@ -2226,6 +1976,17 @@ class SpeechRecognitionManager:
             self._download_progress_callback(1.0, 0, "Complete!")
 
     @staticmethod
+    def _validate_parakeet_release_manifest(model_size: str, model_dir: str) -> None:
+        """Discard failed publisher metadata so retries can reuse verified weights."""
+        try:
+            parakeet.validate_release_manifest(model_size, model_dir)
+        except ChecksumError:
+            filename = parakeet.PARAKEET_MODEL_INFO[model_size].get("manifest")
+            if filename:
+                os.remove(os.path.join(model_dir, filename))
+            raise
+
+    @staticmethod
     def _parakeet_model_is_verified(model_size: str, model_dir: str) -> bool:
         """Hash each bundle file against its pin. Delete only a digest/size mismatch.
 
@@ -2233,7 +1994,7 @@ class SpeechRecognitionManager:
         so the caller does not hand the files to sherpa-onnx.
         """
         verified = True
-        for filename in parakeet.MODEL_FILES:
+        for filename in parakeet.model_files(model_size):
             path = os.path.join(model_dir, filename)
             key = parakeet.manifest_key(model_size, filename)
             try:
@@ -2249,6 +2010,12 @@ class SpeechRecognitionManager:
                     logger.error("Could not remove %s: %s", path, remove_error)
                     return False
                 logger.info("Removed the unverified model file; it will be downloaded again")
+        if verified:
+            try:
+                SpeechRecognitionManager._validate_parakeet_release_manifest(model_size, model_dir)
+            except (ChecksumError, OSError, ValueError) as error:
+                logger.error("Parakeet release manifest verification failed: %s", error)
+                return False
         return verified
 
     def _init_parakeet(self) -> None:
@@ -2317,7 +2084,7 @@ class SpeechRecognitionManager:
             logger.error("Please install it with 'pip install sherpa-onnx'")
             self.state = RecognitionState.ERROR
             raise
-        except (FileNotFoundError, RuntimeError, OSError) as e:
+        except (ChecksumError, FileNotFoundError, RuntimeError, OSError) as e:
             logger.error(f"Failed to initialize Parakeet engine: {e}", exc_info=True)
             self.state = RecognitionState.ERROR
             raise
@@ -2386,7 +2153,12 @@ class SpeechRecognitionManager:
         self._model_initialized = True
         logger.info("Remote API engine setup complete.")
 
-    def _transcribe_with_remote_api(self, audio_buffer: list[bytes], session) -> str:
+    def _transcribe_with_remote_api(
+        self,
+        audio_buffer: list[bytes],
+        session: Optional["requests.Session"],
+        language: Optional[str] = None,
+    ) -> str:
         """Transcribe audio via remote API.
 
         Package audio buffer into WAV format and send to remote server via HTTP POST.
@@ -2396,6 +2168,8 @@ class SpeechRecognitionManager:
         Args:
             audio_buffer: Audio data chunk list (16-bit PCM at 16kHz)
             session: A requests.Session snapshot (obtained under _model_lock)
+            language: Per-utterance snapshot stamped on the queued segment
+                (#805); None resolves the live session language.
 
         Returns:
             Transcribed text
@@ -2431,7 +2205,7 @@ class SpeechRecognitionManager:
             )
 
             # Prepare language parameters
-            lang = resolve_whisper_language(self.language)
+            lang = resolve_whisper_language(self._dictation_language(language))
 
             # Prepare HTTP request headers
             headers = {}
@@ -2610,6 +2384,12 @@ class SpeechRecognitionManager:
     # without a timeout when the CDN is degraded (e.g. 504 / empty body).
     _MODEL_DOWNLOAD_TIMEOUT = (15, 120)
 
+    # How often a blocked request is re-checked for a pending cancel. requests
+    # has no cancellation API, so the blocking open runs on a helper thread:
+    # on cancel the caller stops waiting instead of riding out the whole
+    # network timeout (up to two minutes when a server never answers).
+    _DOWNLOAD_CANCEL_POLL_SECONDS = 0.2
+
     def _stream_model_download(self, url: str, dest_path: str) -> None:
         """Stream a model file from ``url`` to ``dest_path`` with progress.
 
@@ -2618,12 +2398,62 @@ class SpeechRecognitionManager:
         import requests
 
         logger.info(f"Downloading from {url}")
-        response = requests.get(
-            url,
-            stream=True,
-            timeout=self._MODEL_DOWNLOAD_TIMEOUT,
-            headers={"User-Agent": f"vocalinux/{__version__}"},
-        )
+
+        # While requests.get() is stuck resolving, connecting, or waiting for
+        # response headers — exactly what an unreachable server causes — it
+        # cannot see the cancel flag, and Cancel used to wait out the timeout.
+        # The attempt itself stays bounded by _MODEL_DOWNLOAD_TIMEOUT.
+        outcome: dict = {}
+        # Per-attempt stop signal: _download_cancelled is shared state that a
+        # retry resets, so the opener needs its own marker to notice the cancel
+        # that landed while it was still blocked in requests.get().
+        stop_open = threading.Event()
+
+        def _open() -> None:
+            try:
+                response = requests.get(
+                    url,
+                    stream=True,
+                    timeout=self._MODEL_DOWNLOAD_TIMEOUT,
+                    headers={"User-Agent": f"vocalinux/{__version__}"},
+                    proxies=requests_proxies(),
+                )
+            except requests.exceptions.RequestException as e:
+                # Surfaced on the calling thread below.
+                outcome["error"] = e
+                return
+            outcome["response"] = response
+            if stop_open.is_set():
+                # Cancel raced the response landing: the caller has already
+                # given up, so take the late response back and close it rather
+                # than leak an unconsumed socket.
+                outcome.pop("response", None)
+                response.close()
+
+        self._download_openers = {t for t in self._download_openers if t.is_alive()}
+        opener = threading.Thread(target=_open, daemon=True)
+        self._download_openers.add(opener)
+        opener.start()
+        while opener.is_alive():
+            if self._download_cancelled:
+                stop_open.set()
+                # If the response slipped through just as the cancel landed,
+                # the opener's own check may not have run yet; close whatever
+                # arrived late so the socket does not leak either way.
+                late = outcome.pop("response", None)
+                if late is not None:
+                    late.close()
+                logger.info("Download cancelled by user")
+                raise RuntimeError("Download cancelled")
+            opener.join(self._DOWNLOAD_CANCEL_POLL_SECONDS)
+        self._download_openers.discard(opener)
+
+        if "error" in outcome:
+            raise outcome["error"]
+        response = outcome.get("response")
+        if response is None:
+            raise RuntimeError(f"Model download from {url} produced no response")
+
         response.raise_for_status()
 
         content_type = (response.headers.get("content-type") or "").lower()
@@ -2644,6 +2474,7 @@ class SpeechRecognitionManager:
             for data in response.iter_content(chunk_size=chunk_size):
                 if self._download_cancelled:
                     logger.info("Download cancelled by user")
+                    response.close()
                     f.close()
                     if os.path.exists(dest_path):
                         os.remove(dest_path)
@@ -2723,29 +2554,35 @@ class SpeechRecognitionManager:
                 os.remove(temp_file)
             raise
 
-    def _download_whispercpp_model(self):
+    def _download_whispercpp_model(self, model_name: Optional[str] = None) -> None:
         """Download a whisper.cpp model with progress tracking."""
         import requests
 
         self._download_cancelled = False
 
-        model_info = WHISPERCPP_MODEL_INFO.get(self.model_size)
+        model_name = model_name or self.model_size
+        model_info = WHISPERCPP_MODEL_INFO.get(model_name)
         if not model_info:
-            raise ValueError(f"Unknown whisper.cpp model size: {self.model_size}")
+            raise ValueError(f"Unknown whisper.cpp model size: {model_name}")
 
-        url = model_info["url"]
+        url = str(model_info["url"])
         # Prefer explicit download=true (some HF edges serve HTML without it).
         if "huggingface.co" in url and "download=" not in url:
             url = url + ("&" if "?" in url else "?") + "download=true"
-        model_path = get_model_path(self.model_size)
+        model_path = get_model_path(model_name)
         temp_file = model_path + ".tmp"
 
         os.makedirs(os.path.dirname(model_path), exist_ok=True)
 
-        logger.info(f"Downloading whisper.cpp {self.model_size} model to {model_path}")
+        logger.info(f"Downloading whisper.cpp {model_name} model to {model_path}")
 
         try:
             self._stream_model_download(url, temp_file)
+            # Say so before hashing: on a multi-hundred-MB model this is
+            # seconds with nothing else to show, and the UI would otherwise
+            # sit on the last chunk's update. Same step the Vosk path reports.
+            if self._download_progress_callback:
+                self._download_progress_callback(1.0, 0, "Verifying model...")
             # Verify before the rename: whisper.cpp loads ggml files through
             # ctypes, so an unverified file must never reach its final path
             # where is_model_downloaded() would treat it as good.
@@ -2775,6 +2612,16 @@ class SpeechRecognitionManager:
             if os.path.exists(temp_file):
                 os.remove(temp_file)
             raise
+
+    def download_whispercpp_model(self, model_name: str) -> None:
+        """Download a catalog whisper.cpp model without changing engine config.
+
+        Used by surfaces that need a model the dictation engine does not load
+        (e.g. the TinyDiarize file-transcription flow). The engine's cancel
+        flag and progress callback apply, so the existing
+        try_begin_download/end_download coordination keeps working.
+        """
+        self._download_whispercpp_model(model_name)
 
     def _get_vosk_model_path(self) -> str:
         """Get the path to the VOSK model based on the selected size and language."""
@@ -3009,6 +2856,32 @@ class SpeechRecognitionManager:
         """Set the text callbacks list (used for temporarily replacing callbacks)."""
         self.text_callbacks = list(callbacks)
 
+    def register_segment_callback(self, callback: Callable[[str, float], None]) -> None:
+        """
+        Register a callback invoked with ``(text, started_at)`` per segment.
+
+        ``started_at`` is the ``time.monotonic()`` timestamp when the
+        segment's audio capture began. Segment callbacks run on the
+        recognition thread just before the text callbacks.
+
+        Args:
+            callback: A function taking (recognized_text, capture_started_at)
+        """
+        self.segment_callbacks.append(callback)
+
+    def unregister_segment_callback(self, callback: Callable[[str, float], None]) -> None:
+        """
+        Unregister a segment callback function.
+
+        Args:
+            callback: The callback function to remove.
+        """
+        try:
+            self.segment_callbacks.remove(callback)
+            logger.debug(f"Unregistered segment callback: {callback}")
+        except ValueError:
+            logger.warning(f"Callback {callback} not found in segment_callbacks.")
+
     def register_state_callback(self, callback: Callable[[RecognitionState], None]):
         """
         Register a callback function that will be called when the recognition state changes.
@@ -3084,6 +2957,11 @@ class SpeechRecognitionManager:
             new_state: The new recognition state
         """
         self.state = new_state
+        if new_state in (RecognitionState.IDLE, RecognitionState.ERROR):
+            # A per-language shortcut's override lasts for exactly one
+            # dictation (#805); restore the configured language here so every
+            # exit path — normal stop, error, quit — unwinds it.
+            self._restore_language_after_oneshot()
         for callback in self.state_callbacks:
             callback(new_state)
 
@@ -3108,6 +2986,89 @@ class SpeechRecognitionManager:
         chunk_duration_ms = (1024 / 16000) * 1000
         return int(guard_ms / chunk_duration_ms)
 
+    def _playback_duck_delay_seconds(self) -> float:
+        """How long to let the start cue play before lowering other audio.
+
+        Sound effects off, or the Off tone, duck immediately. A mocked or
+        broken feedback module also ducks immediately rather than guessing.
+        """
+        try:
+            from ..ui import audio_feedback
+
+            enabled_fn = getattr(audio_feedback, "_is_sound_effects_enabled", None)
+            tone_fn = getattr(audio_feedback, "_resolved_tone", None)
+            duration_fn = getattr(audio_feedback, "_wav_duration_seconds", None)
+            path_fn = getattr(audio_feedback, "tone_sound_path", None)
+            # Separate checks so the type checker treats each as callable.
+            if not callable(enabled_fn) or not callable(tone_fn):
+                return 0.0
+            if not callable(duration_fn) or not callable(path_fn):
+                return 0.0
+            enabled = enabled_fn()
+            tone = tone_fn()
+            if not isinstance(enabled, bool) or not isinstance(tone, str):
+                return 0.0
+            if not enabled or tone == "off":
+                return duck_delay_seconds(
+                    sound_effects_enabled=False, tone=tone, cue_duration_seconds=0.0
+                )
+            path = path_fn(tone, "start")
+            if not isinstance(path, str):
+                return 0.0
+            duration = duration_fn(path)
+            if isinstance(duration, bool) or not isinstance(duration, (int, float)):
+                return 0.0
+            return duck_delay_seconds(
+                sound_effects_enabled=True,
+                tone=tone,
+                cue_duration_seconds=float(duration),
+            )
+        except Exception:
+            logger.warning(
+                "Could not measure the start cue; ducking other audio immediately",
+                exc_info=True,
+            )
+            return 0.0
+
+    def _arm_playback_duck(self) -> None:
+        """Schedule a duck once dictation is actually listening."""
+        try:
+            if not self._playback_duck.enabled():
+                return
+            if is_pipewire_device(self.audio_device_index, self.audio_device_name):
+                # Ducking lowers the default sink — the very audio a
+                # system-audio source is capturing.
+                return
+            # The capture thread may already have failed and released the duck;
+            # arming now would lower playback in the error state with nothing
+            # left to put it back.
+            with self._playback_duck_lock:
+                if not self.should_record or self.state != RecognitionState.LISTENING:
+                    return
+                self._playback_duck.start(self._playback_duck_delay_seconds())
+        except Exception:
+            logger.error("Could not schedule playback duck", exc_info=True)
+
+    def _cancel_pending_playback_duck(self) -> None:
+        """Drop a duck whose timer has not fired. Does not change the volume."""
+        try:
+            self._playback_duck.cancel()
+        except Exception:
+            logger.error("Could not cancel playback duck", exc_info=True)
+
+    def release_playback_duck(self) -> None:
+        """Cancel a not-yet-applied duck and restore the sink. Safe to call twice.
+
+        Used when dictation ends, including error exits and quitting while the
+        microphone is still open. Failures are logged and never raised.
+        """
+        with self._playback_duck_lock:
+            self._cancel_pending_playback_duck()
+            try:
+                self._playback_duck.restore()
+            except Exception:
+                logger.error("Could not restore playback volume", exc_info=True)
+
     def start_recognition(self, mode: str = "toggle") -> bool:
         """Start the speech recognition process.
 
@@ -3115,6 +3076,8 @@ class SpeechRecognitionManager:
             True if recognition actually started (state is LISTENING), False if
             blocked (wrong state, auto-paused, or model not ready).
         """
+        if getattr(self, "_buffered_reload_session", False):
+            return False
         if self.state != RecognitionState.IDLE:
             logger.warning(f"Cannot start recognition in current state: {self.state}")
             return False
@@ -3132,11 +3095,13 @@ class SpeechRecognitionManager:
             )
             return False
 
+        reload_in_background = False
         # Check if model is ready (lazy-reload after idle keep-alive unload)
         if not self.model_ready:
             if self._idle_unloaded:
-                logger.info("Model was unloaded by keep-alive; reloading before dictation")
-                if not self.ensure_model_loaded():
+                logger.info("Model was unloaded by keep-alive; reloading for dictation")
+                reload_in_background = getattr(self, "buffer_during_reload", False)
+                if not reload_in_background and not self.ensure_model_loaded():
                     play_error_sound()
                     _show_notification(
                         "Model Reload Failed",
@@ -3160,6 +3125,28 @@ class SpeechRecognitionManager:
                     )
                 return False
 
+        self._buffered_reload_session = reload_in_background
+        self._reload_pending = reload_in_background
+        if reload_in_background:
+            self._buffered_capture_failed = False
+            self._capture_finished.clear()
+            self._cancel_buffered_session.clear()
+
+        # Last thing before listening, so the language matches the layout the
+        # user is typing in right now rather than the one they had at startup.
+        self._refresh_language_from_layout()
+
+        # A per-language shortcut's override runs after the layout refresh so
+        # the explicit key press still wins over follow-mode resolution, and
+        # so its capability check sees the model the refresh will serve (#805).
+        if not self._apply_pending_language_override():
+            return False
+
+        # Bind this session's language for the transcription workers: they can
+        # outlive stop_recognition's joins, and the one-shot restore must not
+        # rewrite the language of a segment still in the queue (#805).
+        self._session_language = self.language
+
         logger.info("Starting speech recognition")
         self._update_state(RecognitionState.LISTENING)
 
@@ -3170,6 +3157,7 @@ class SpeechRecognitionManager:
         self.should_record = True
         self._recognition_mode = mode
         self.audio_buffer = []
+        self._segment_started_at = None
         self._segment_queue = queue.Queue(maxsize=32)
 
         # Start the audio recording thread
@@ -3178,9 +3166,12 @@ class SpeechRecognitionManager:
         self.audio_thread.start()
 
         # Start the recognition thread
-        self.recognition_thread = threading.Thread(target=self._perform_recognition)
+        target = self._reload_and_recognize if reload_in_background else self._perform_recognition
+        self.recognition_thread = threading.Thread(target=target)
         self.recognition_thread.daemon = True
         self.recognition_thread.start()
+        # After the threads exist: a start that returned early must not duck.
+        self._arm_playback_duck()
         return True
 
     def stop_recognition(self):
@@ -3188,16 +3179,23 @@ class SpeechRecognitionManager:
         if self.state == RecognitionState.IDLE:
             return
 
+        if getattr(self, "_buffered_reload_session", False) and not self.should_record:
+            return
         logger.info("Stopping speech recognition")
 
-        # Stop recording FIRST to prevent capturing the stop sound
+        # Mark recording over before touching the duck so a concurrent arm
+        # sees the dictation as ended. The volume goes back only once the
+        # microphone thread has left the device, and before the stop cue.
         self.should_record = False
+        self._cancel_pending_playback_duck()
 
         # Wait for audio thread to finish recording and enqueue any pending audio
         # This is critical to prevent race condition where recognition thread exits
         # before the final audio segment is enqueued
         if self.audio_thread and self.audio_thread.is_alive():
             self.audio_thread.join(timeout=2.0)
+
+        self.release_playback_duck()
 
         # Play stop sound now that the audio thread is done and cannot capture it.
         # Kept before buffer processing so the cue still feels immediate.
@@ -3227,6 +3225,14 @@ class SpeechRecognitionManager:
                 self.audio_buffer = []
             self._recording_segment_has_speech = False
 
+        if getattr(self, "_buffered_reload_session", False):
+            # Keep the session busy until its queued audio has been transcribed.
+            # In particular, key release must not wait for a cold model load.
+            self._update_state(RecognitionState.PROCESSING)
+            self._signal_recognition_stop()
+            self._capture_finished.set()
+            return
+
         # Wake up recognition thread so it can drain queued segments and stop
         self._signal_recognition_stop()
 
@@ -3240,6 +3246,115 @@ class SpeechRecognitionManager:
         self._recognition_mode = "toggle"
         self._update_state(RecognitionState.IDLE)
 
+    def _reload_and_recognize(self) -> None:
+        """Reload an idle model while the recording thread captures speech."""
+        try:
+            # Idle unload already released the engine resources. Resume reinit
+            # cannot be used here because it stops the active microphone.
+            with self._model_lock:
+                if not self._cancel_buffered_session.is_set():
+                    self._init_selected_engine()
+                    if not self.model_ready:
+                        raise RuntimeError("Speech model did not become ready")
+                    self._idle_unloaded = False
+            self._reload_pending = False
+            if self._buffered_capture_failed or self.state == RecognitionState.ERROR:
+                raise RuntimeError("Audio capture failed during model reload")
+            if not self._cancel_buffered_session.is_set():
+                self._perform_recognition()
+        except (ChecksumError, ImportError, OSError, RuntimeError, ValueError):
+            logger.exception("Failed to reload model or transcribe buffered speech")
+            play_error_sound()
+            _show_notification(
+                "Dictation Failed",
+                "Could not reload the speech model or transcribe the recording. Please try again.",
+                "dialog-warning",
+            )
+        finally:
+            self._reload_pending = False
+            if self.should_record:
+                self.stop_recognition()
+            # stop_recognition owns the final buffer. Do not finish or allow a
+            # new session until key release has completed that handoff.
+            self._capture_finished.wait()
+            # The worker can exit during the bounded audio-thread join in
+            # stop_recognition, leaving the released key's final buffer — and
+            # any stragglers it never consumed — queued behind the stop
+            # sentinel. Transcribe what is still here before replacing the
+            # queue so the tail of the recording is not silently dropped.
+            # A failed capture or an explicit cancel still discards it.
+            if (
+                self.model_ready
+                and not self._buffered_capture_failed
+                and not self._cancel_buffered_session.is_set()
+            ):
+                self._transcribe_queued_segments()
+            with self._buffer_lock:
+                self.audio_buffer = []
+            self._segment_queue = queue.Queue(maxsize=32)
+            self._recognition_mode = "toggle"
+            self._buffered_reload_session = False
+            # The notification above reports the failed attempt. Return to IDLE
+            # so a release that happened during reload cannot strand the manager
+            # in ERROR and block every later dictation attempt.
+            self._update_state(RecognitionState.IDLE)
+
+    def _cancel_reload_recording(self) -> None:
+        """Discard a buffered session before changing or releasing its engine."""
+        if not getattr(self, "_buffered_reload_session", False):
+            return
+        self._cancel_buffered_session.set()
+        self.stop_recognition()
+        if self.recognition_thread and self.recognition_thread is not threading.current_thread():
+            self.recognition_thread.join()
+
+    def _signal_buffered_capture_done(self) -> None:
+        """Release the reload worker once a failed capture can no longer hand off.
+
+        A buffered session whose capture died has no ``stop_recognition``
+        handoff left — key release already returned early — so the reload
+        worker's ``_capture_finished.wait()`` would block forever.
+        """
+        if getattr(self, "_buffered_reload_session", False) and self._buffered_capture_failed:
+            self._capture_finished.set()
+
+    def start_recognition_with_language(self, language: str, mode: str = "toggle") -> bool:
+        """Start dictation in ``language`` for this utterance only (#805).
+
+        The configured preference is untouched: when this dictation ends the
+        engine's language is restored, so the next plain hotkey behaves as
+        before. When the loaded engine/model cannot transcribe ``language``
+        without a reload (VOSK, Parakeet, an English-only whisper.cpp model),
+        starting is refused with the usual error cue rather than dictating in
+        the wrong language.
+
+        Args:
+            language: A catalog id (e.g. "de", "auto") as stored by
+                ``shortcuts.language_shortcuts``.
+            mode: "toggle" or "push_to_talk", same as start_recognition.
+
+        Returns:
+            True if recognition actually started, False otherwise.
+        """
+        target = normalize_language_for_engine(self.engine, language)
+        if target != language:
+            # The engine drops the requested language entirely: Parakeet maps
+            # every catalog id to auto, so a labeled shortcut could never
+            # select it.
+            self._refuse_language_override(language)
+            return False
+        if target != self.language and not self._serving_model_supports_language_switch():
+            self._refuse_language_override(language)
+            return False
+
+        self._pending_language_override = language
+        try:
+            return self.start_recognition(mode=mode)
+        finally:
+            # The override only ever feeds the next start attempt, whether it
+            # ran or was refused by the guards inside start_recognition.
+            self._pending_language_override = None
+
     def _record_audio(self):
         """Record audio from the microphone with reconnection logic."""
         # Lazy import to avoid circular dependency
@@ -3247,120 +3362,75 @@ class SpeechRecognitionManager:
 
         try:
             import numpy as np
-            import pyaudio
         except ImportError as e:
             logger.error(f"Failed to import required audio libraries: {e}")
             logger.error("Please install required dependencies: pip install pyaudio numpy")
+            self.should_record = False
+            self.release_playback_duck()
             play_error_sound()
+            self._buffered_capture_failed = True
             self._update_state(RecognitionState.ERROR)
+            self._signal_buffered_capture_done()
             return
 
         try:
             # PyAudio configuration
             CHUNK = 1024
-            FORMAT = pyaudio.paInt16
 
-            # Initialize PyAudio with reconnection support
-            self._pyaudio_instance = pyaudio.PyAudio()
-            audio = self._pyaudio_instance
-
-            # Resolve the input device by name first (indices can shift between
-            # sessions due to USB replugging or virtual devices being added).
-            # Fall back to the stored index, then to the system default.
-            use_system_default = self.audio_device_index is None and self.audio_device_name is None
-            if use_system_default:
-                resolved_device_index = None
-            else:
-                resolved_device_index = _resolve_device_by_name(
-                    audio, self.audio_device_name, self.audio_device_index
-                )
-                if resolved_device_index is None:
-                    resolved_device_index = _resolve_valid_input_device(audio, None)
-            if resolved_device_index is None and not use_system_default:
-                # No safe enumerated mic left (e.g. only PipeWire pseudo devices).
-                # Fall back to PortAudio system default instead of aborting.
-                logger.warning(
-                    "No safe audio input devices enumerated; "
-                    "falling back to system default capture."
-                )
-                resolved_device_index = None
-                use_system_default = True
-
-            # Log available devices for debugging (skip virtual devices)
-            logger.debug("Available audio input devices:")
-            for i in range(audio.get_device_count()):
+            # The capture source owns the device: resolution, format
+            # negotiation, downmixing, and resampling. PipeWire sources spawn
+            # pw-record themselves and need no PyAudio instance; PortAudio
+            # sources get one passed to open()/reopen(). This loop only
+            # consumes mono 16 kHz chunks and applies dictation segmentation
+            # policy.
+            source = self._new_capture_source()
+            audio = None
+            if getattr(source, "requires_pyaudio", True):
                 try:
-                    info = audio.get_device_info_by_index(i)
-                    if info.get("maxInputChannels", 0) > 0:
-                        name = info.get("name", "")
-                        if _is_virtual_device(name):
-                            continue
-                        logger.debug(f"  [{i}] {name} (inputs: {info.get('maxInputChannels')})")
-                except (IOError, OSError):
-                    continue
-
-            # Negotiate the format and open the capture stream in ONE PortAudio
-            # open — Bluetooth SCO devices abort with heap corruption when the
-            # stream is opened, closed, and quickly reopened (issue #567).
-            CHANNELS, RATE, negotiated_stream = _open_capture_stream(audio, resolved_device_index)
-            logger.info(f"Using {CHANNELS} channel(s) for recording")
-            self._capture_sample_rate = RATE
-            self._capture_channels = CHANNELS
-            self._capture_downmix_channel = None  # New stream: speech-gated sticky unset
-            logger.info(f"Using sample rate: {RATE}Hz")
+                    import pyaudio
+                except ImportError as e:
+                    logger.error(f"Failed to import required audio libraries: {e}")
+                    logger.error("Please install required dependencies: pip install pyaudio numpy")
+                    self.should_record = False
+                    self.release_playback_duck()
+                    play_error_sound()
+                    self._buffered_capture_failed = True
+                    self._update_state(RecognitionState.ERROR)
+                    self._signal_buffered_capture_done()
+                    return
+                self._pyaudio_instance = pyaudio.PyAudio()
+                audio = self._pyaudio_instance
+            self._capture_source = source
+            # The attempt count belongs to this session — a previous thread
+            # may still be finishing and must not leave its retries here.
+            # _last_audio_error_time stays: it also throttles a device that
+            # fails again within seconds of the previous session's error.
+            self._reconnection_attempts = 0
 
             try:
-                if resolved_device_index is None:
-                    device_info = audio.get_default_input_device_info()
-                    logger.info(f"Using system default audio device: {device_info.get('name')}")
-                else:
-                    device_info = audio.get_device_info_by_index(resolved_device_index)
-                    logger.info(
-                        f"Using audio device [{resolved_device_index}]: {device_info.get('name')}"
-                    )
-            except (IOError, OSError):
-                logger.warning(f"Could not get info for device index {resolved_device_index}")
+                source.open(audio)
+            except (IOError, OSError) as e:
+                # The negotiated rate is stored before the fallback open can
+                # raise; read it before a reconnection renegotiates. Silence
+                # accounting has always used the first-negotiated rate.
+                RATE = source.sample_rate
+                logger.error(f"Failed to open audio stream: {e}")
+                logger.error("This may indicate a problem with the audio device or permissions.")
 
-            if negotiated_stream is not None:
-                self._audio_stream = negotiated_stream
-                stream = negotiated_stream
-            else:
-                # Negotiation failed; fall back to a plain open so the
-                # existing reconnection/error path still applies.
-                stream_kwargs = {
-                    "format": FORMAT,
-                    "channels": CHANNELS,
-                    "rate": RATE,
-                    "input": True,
-                    "frames_per_buffer": CHUNK,
-                }
-
-                # Use the resolved device (skip if already system default)
-                try:
-                    default_idx = audio.get_default_input_device_info().get("index")
-                except (IOError, OSError):
-                    default_idx = None
-                if resolved_device_index is not None and resolved_device_index != default_idx:
-                    stream_kwargs["input_device_index"] = resolved_device_index
-
-                try:
-                    self._audio_stream = audio.open(**stream_kwargs)
-                    stream = self._audio_stream
-                except (IOError, OSError) as e:
-                    logger.error(f"Failed to open audio stream: {e}")
-                    logger.error(
-                        "This may indicate a problem with the audio device or permissions."
-                    )
-
-                    # Attempt reconnection
-                    if self._attempt_audio_reconnection(audio):
-                        stream = self._audio_stream
-                        CHANNELS = self._capture_channels
-                    else:
-                        play_error_sound()
+                # Attempt reconnection
+                if not self._attempt_audio_reconnection(audio):
+                    self.should_record = False
+                    self.release_playback_duck()
+                    play_error_sound()
+                    if audio is not None:
                         audio.terminate()
-                        self._update_state(RecognitionState.ERROR)
-                        return
+                    self._buffered_capture_failed = True
+                    self._update_state(RecognitionState.ERROR)
+                    return
+            else:
+                RATE = source.sample_rate
+
+            self._sync_capture_state()
 
             logger.info("Audio recording started")
 
@@ -3370,6 +3440,7 @@ class SpeechRecognitionManager:
             self._recording_segment_has_speech = False
             log_level_interval = 0  # Counter for periodic level logging
             max_level_seen = 0.0
+            capture_failed = False
             # Accumulator for 512-sample Silero chunks.  When the capture rate
             # is higher than 16 kHz (e.g. 48 kHz), resampling produces fewer
             # than 1024 samples per read (~341 at 48 kHz), so the buffer may
@@ -3387,6 +3458,8 @@ class SpeechRecognitionManager:
                     # Check buffer size and enforce limits (with lock for thread safety)
                     with self._buffer_lock:
                         if len(self.audio_buffer) >= self._max_buffer_size:
+                            if getattr(self, "_reload_pending", False):
+                                raise RuntimeError("Audio buffer filled while reloading the model")
                             logger.warning(
                                 f"Audio buffer limit reached ({len(self.audio_buffer)} chunks). Clearing oldest data."
                             )
@@ -3395,30 +3468,14 @@ class SpeechRecognitionManager:
                             self.audio_buffer = self.audio_buffer[remove_count:]
                             logger.info(f"Buffer trimmed by {remove_count} chunks")
 
-                        data = stream.read(CHUNK, exception_on_overflow=False)
+                        data = source.read_chunk()
 
-                        # Convert multi-channel capture to mono if necessary
-                        # Speech recognition engines expect mono (1 channel) audio
-                        if CHANNELS > 1:
-                            audio_array = np.frombuffer(data, dtype=np.int16)
-                            mono, selected = _downmix_to_mono(
-                                audio_array, CHANNELS, self._capture_downmix_channel
-                            )
-                            self._capture_downmix_channel = selected
-                            data = mono.tobytes()
-
-                        # Resample to 16kHz if capturing at non-16kHz for Vosk/Whisper compatibility
-                        if self._capture_sample_rate != 16000:
-                            audio_array = np.frombuffer(data, dtype=np.int16)
-                            resample_ratio = 16000 / self._capture_sample_rate
-                            resampled_length = int(len(audio_array) * resample_ratio)
-                            resampled = np.interp(
-                                np.linspace(0, len(audio_array), resampled_length),
-                                np.arange(len(audio_array)),
-                                audio_array,
-                            ).astype(np.int16)
-                            data = resampled.tobytes()
-
+                        if not self.audio_buffer:
+                            # First chunk of a new segment: remember when its
+                            # capture began. A mid-session history clear
+                            # compares against this to separate speech
+                            # captured before it from speech captured after.
+                            self._segment_started_at = time.monotonic()
                         self.audio_buffer.append(data)
 
                     # Voice Activity Detection (VAD)
@@ -3493,10 +3550,11 @@ class SpeechRecognitionManager:
                                         "Silence detected with no speech, dropping audio buffer"
                                     )
                                     self.audio_buffer = []
-                                elif self._recognition_mode == "push_to_talk":
+                                elif self._recognition_mode == "push_to_talk" or getattr(
+                                    self, "_reload_pending", False
+                                ):
                                     logger.debug(
-                                        "Silence detected in push-to-talk mode, "
-                                        "deferring transcription until key release"
+                                        "Keeping speech until key release or model reload completes"
                                     )
                                 else:
                                     logger.debug("Silence detected, queueing audio segment")
@@ -3531,36 +3589,48 @@ class SpeechRecognitionManager:
 
                         if self._attempt_audio_reconnection(audio):
                             logger.info("Audio reconnection successful, continuing recording")
-                            stream = self._audio_stream  # Update stream reference
-                            CHANNELS = self._capture_channels
-                            continue  # Continue recording with new stream
+                            # The session source may have been rebuilt (e.g.
+                            # the configured device switched between a mic and
+                            # a PipeWire sink) — keep reading the new source.
+                            source = self._capture_source
+                            continue  # Continue recording with the reopened source
                         else:
                             logger.error("Audio reconnection failed, stopping recording")
+                            capture_failed = True
                             break
                     else:
                         logger.warning(
                             "Audio error occurred too soon after last error, stopping recording"
                         )
+                        capture_failed = True
                         break
                 except Exception as e:
                     logger.error(f"Unexpected error reading audio data: {e}")
+                    capture_failed = True
                     break
 
+            # A dead microphone must not leave other audio lowered, or the
+            # session stuck in LISTENING, until the user happens to stop.
+            if capture_failed:
+                self.should_record = False
+                self.release_playback_duck()
+                play_error_sound()
+                self._buffered_capture_failed = True
+                self._update_state(RecognitionState.ERROR)
+
             # Clean up
-            _safe_close_stream(stream)
+            source.close()
 
-            if audio and hasattr(audio, "terminate"):
-                try:
-                    audio.terminate()
-                except Exception as e:
-                    logger.warning(f"Error terminating PyAudio: {e}")
-
-            # Reset audio stream reference and reconnection state
-            self._audio_stream = None
-            self._pyaudio_instance = None
-            self._capture_downmix_channel = None
-            self._reconnection_attempts = 0
-            self._last_audio_error_time = 0
+            # Reset audio stream reference and reconnection state. A session
+            # started after a stop-timeout may already own these fields, so
+            # only clear the ones still bound to this capture.
+            if self._capture_source is source:
+                self._audio_stream = None
+                self._pyaudio_instance = None
+                self._capture_downmix_channel = None
+                self._reconnection_attempts = 0
+                self._last_audio_error_time = 0
+                self._capture_source = None
 
             # Log summary
             if not speech_detected_in_session and max_level_seen < 5:
@@ -3574,8 +3644,13 @@ class SpeechRecognitionManager:
 
         except Exception as e:
             logger.error(f"Error in audio recording: {e}")
+            self.should_record = False
+            self.release_playback_duck()
             play_error_sound()
+            self._buffered_capture_failed = True
             self._update_state(RecognitionState.ERROR)
+        finally:
+            self._signal_buffered_capture_done()
 
     def _process_final_buffer(self):
         """Process the final audio buffer after silence is detected."""
@@ -3588,10 +3663,20 @@ class SpeechRecognitionManager:
 
         self._process_audio_buffer(audio_buffer)
 
-    def _process_audio_buffer(self, audio_buffer: list[bytes]):
-        """Process an immutable audio segment for transcription and commands."""
+    def _process_audio_buffer(
+        self, audio_buffer: list[bytes], language: Optional[str] = None
+    ) -> None:
+        """Process an immutable audio segment for transcription and commands.
+
+        ``language`` is the per-utterance snapshot stamped on the segment when
+        it was queued (#805); None falls back to the segment's own stamp and
+        then to the live session language.
+        """
         if not audio_buffer:
             return
+        if language is None:
+            language = getattr(audio_buffer, "language", None)
+        dictation_language = self._dictation_language(language)
 
         if self.engine == "vosk":
             # Lock recognizer access to prevent race condition with reconfigure
@@ -3607,16 +3692,16 @@ class SpeechRecognitionManager:
                 text = result.get("text", "")
 
         elif self.engine == "whisper":
-            text = self._transcribe_with_whisper(audio_buffer)
+            text = self._transcribe_with_whisper(audio_buffer, dictation_language)
 
         elif self.engine == "whisper_cpp":
-            text = self._transcribe_with_whispercpp(audio_buffer)
+            text = self._transcribe_with_whispercpp(audio_buffer, dictation_language)
 
         elif self.engine == "parakeet":
             text = self._transcribe_with_parakeet(audio_buffer)
 
         elif self.engine == "faster_whisper":
-            text = self._transcribe_with_faster_whisper(audio_buffer)
+            text = self._transcribe_with_faster_whisper(audio_buffer, dictation_language)
 
         elif self.engine == "remote_api":
             # Snapshot the HTTP session under lock to prevent race with
@@ -3630,7 +3715,7 @@ class SpeechRecognitionManager:
             if session is None:
                 logger.error("Remote API HTTP session not initialized")
                 return
-            text = self._transcribe_with_remote_api(audio_buffer, session)
+            text = self._transcribe_with_remote_api(audio_buffer, session, dictation_language)
 
         else:
             logger.error(f"Unknown engine: {self.engine}")
@@ -3639,6 +3724,9 @@ class SpeechRecognitionManager:
         # Process text - either with voice commands or pass through directly
         logger.debug(f"_process_audio_buffer got text='{text[:50] if text else '(empty)'}...'")
         if text:
+            # Corrections must precede command parsing: a safe replacement can
+            # stop a model mishearing from triggering a destructive action.
+            text = self._apply_dictionary_corrections(text)
             if self._voice_commands_enabled:
                 # Process with voice commands (original behavior)
                 processed_text, actions = self.command_processor.process_text(text)
@@ -3660,6 +3748,11 @@ class SpeechRecognitionManager:
                 f"processed_text='{processed_text[:50] if processed_text else '(empty)'}...', callbacks={len(self.text_callbacks)}"
             )
             if processed_text:
+                started_at = getattr(audio_buffer, "started_at", None)
+                if started_at is None:
+                    started_at = time.monotonic()
+                for segment_callback in self.segment_callbacks:
+                    segment_callback(processed_text, started_at)
                 for callback in self.text_callbacks:
                     logger.debug(
                         f"invoking text callback: {callback.__name__ if hasattr(callback, '__name__') else callback}"
@@ -3680,7 +3773,7 @@ class SpeechRecognitionManager:
                     f"Recognition loop - should_record={self.should_record}, queue_empty={self._segment_queue.empty()}"
                 )
                 try:
-                    segment = self._segment_queue.get(timeout=0.1)
+                    queued = self._segment_queue.get(timeout=0.1)
                 except queue.Empty:
                     # Only exit if we're not recording AND queue is empty
                     if not self.should_record and self._segment_queue.empty():
@@ -3689,7 +3782,7 @@ class SpeechRecognitionManager:
                         )
                         # Give a brief moment for any final items to be enqueued
                         try:
-                            segment = self._segment_queue.get(timeout=0.5)
+                            queued = self._segment_queue.get(timeout=0.5)
                         except queue.Empty:
                             logger.debug("Recognition loop - no more items, exiting")
                             break
@@ -3697,28 +3790,30 @@ class SpeechRecognitionManager:
                         logger.debug("Recognition loop - queue timeout, continuing")
                         continue
 
-                if segment is None:
+                if queued is None:
                     logger.debug("Recognition loop - got None signal, draining remaining items...")
                     # Drain any remaining items before exiting
                     while not self._segment_queue.empty():
                         try:
                             remaining = self._segment_queue.get_nowait()
                             if remaining is not None:
+                                remaining_segment, remaining_language = remaining
                                 logger.debug(
-                                    f"Recognition loop - processing remaining segment with {len(remaining)} chunks"
+                                    f"Recognition loop - processing remaining segment with {len(remaining_segment)} chunks"
                                 )
                                 if self.should_record:
                                     self._update_state(RecognitionState.PROCESSING)
-                                self._process_audio_buffer(remaining)
+                                self._process_audio_buffer(remaining_segment, remaining_language)
                         except queue.Empty:
                             break
                     logger.debug("Recognition loop - exiting after None signal")
                     break
 
+                segment, segment_language = queued
                 logger.debug(f"Recognition loop - processing segment with {len(segment)} chunks")
                 if self.should_record:
                     self._update_state(RecognitionState.PROCESSING)
-                self._process_audio_buffer(segment)
+                self._process_audio_buffer(segment, segment_language)
                 if self.should_record:
                     self._update_state(RecognitionState.LISTENING)
         finally:
@@ -3731,21 +3826,27 @@ class SpeechRecognitionManager:
 
     def _enqueue_audio_segment(self, audio_buffer: list[bytes]):
         """Queue an audio segment for asynchronous transcription."""
-        segment = audio_buffer.copy()
+        segment = _AudioSegment(audio_buffer.copy(), self._segment_started_at)
         if not segment:
             logger.warning("_enqueue_audio_segment called with empty buffer")
             return
 
         logger.debug(f"_enqueue_audio_segment called with {len(segment)} chunks")
 
+        # Stamp this utterance's language on the segment: a worker that
+        # outlives its dictation (or drains another session's queue) must
+        # transcribe each segment in the language it was recorded under, not
+        # whatever a newer session stored in _session_language (#805).
+        segment.language = self._dictation_language()
+        stamped = (segment, segment.language)
         try:
-            self._segment_queue.put_nowait(segment)
+            self._segment_queue.put_nowait(stamped)
             logger.debug("Enqueued segment successfully")
         except queue.Full:
             logger.warning("Transcription queue is full, dropping oldest pending segment")
             try:
                 self._segment_queue.get_nowait()
-                self._segment_queue.put_nowait(segment)
+                self._segment_queue.put_nowait(stamped)
             except queue.Empty:
                 logger.warning("Could not recover queue space for transcription segment")
 
@@ -3759,6 +3860,30 @@ class SpeechRecognitionManager:
                 self._segment_queue.put_nowait(None)
             except queue.Empty:
                 logger.debug("Recognition queue emptied before stop signal")
+
+    def _transcribe_queued_segments(self) -> None:
+        """Transcribe audio segments still queued after the worker exited.
+
+        Runs on the reload thread once key release has finished its handoff,
+        so segments that missed the worker's final drain — the released
+        key's tail buffer queued during its bounded join — are still
+        transcribed instead of being thrown away with the queue.
+        """
+        while True:
+            try:
+                queued = self._segment_queue.get_nowait()
+            except queue.Empty:
+                return
+            if queued is None:
+                continue
+            # Queue items are (segment, language) tuples stamped at enqueue
+            # time — the language must reach the decoder or the buffer is
+            # transcribed under the wrong language.
+            segment, segment_language = queued
+            try:
+                self._process_audio_buffer(segment, segment_language)
+            except (ChecksumError, ImportError, OSError, RuntimeError, ValueError):
+                logger.exception("Failed to transcribe a leftover buffered segment")
 
     def reconfigure(
         self,
@@ -3795,6 +3920,8 @@ class SpeechRecognitionManager:
             f"audio_device={audio_device_index}, audio_device_name={audio_device_name}"
         )
 
+        self._cancel_reload_recording()
+
         whispercpp_attrs = tuple(
             name for name in self._RECONFIGURE_STATE_ATTRS if name.startswith("whispercpp_")
         )
@@ -3814,10 +3941,22 @@ class SpeechRecognitionManager:
         # Whisper needs to know the language for transcription
         # VOSK needs to load a different model for the new language
         language_changed = False
-        if language is not None and language != self.language:
-            self.language = language
-            language_changed = True
-            restart_needed = True
+        if language is not None:
+            # A new configured language replaces any pending one-shot restore:
+            # if this reconfigure stops an in-flight per-language dictation,
+            # the restore must not undo what was just set here (#805).
+            self._oneshot_language_restore = None
+            # Settings hands over the preference, which may be the sentinel. Keep
+            # it so the follow mode survives, and resolve what the engine gets.
+            self.language_preference = language
+            resolved = resolve_language_preference(language)
+            if resolved != self.language:
+                self.language = resolved
+                language_changed = True
+                # Only the engines that bake the language into the loaded model
+                # need the restart; see _can_relanguage_without_reload.
+                if not self._can_relanguage_without_reload():
+                    restart_needed = True
 
         # Parakeet never consumes catalog language. Apply after engine/language
         # updates so switching TO parakeet also clears a leftover code.
@@ -3830,6 +3969,9 @@ class SpeechRecognitionManager:
         # Command aliases follow the stored language (auto after Parakeet).
         if language_changed:
             self.command_processor.set_language(self.language)
+            if not restart_needed and self._faster_whisper_engine is not None:
+                # No re-init will rebuild it, so update the live engine in place.
+                self._faster_whisper_engine.language = self.language
 
         # Update VOSK specific params if provided
         if vad_sensitivity is not None:
@@ -3855,7 +3997,10 @@ class SpeechRecognitionManager:
 
         for param_name in whispercpp_attrs:
             if param_name in kwargs:
-                setattr(self, param_name, kwargs[param_name])
+                value = kwargs[param_name]
+                if param_name == "whispercpp_language_candidates":
+                    value = self._normalize_language_candidates(value)
+                setattr(self, param_name, value)
                 restart_needed = True
 
         # Handle Remote API settings
@@ -3913,6 +4058,11 @@ class SpeechRecognitionManager:
                     # with unsaved VAD/device/API knobs while the UI shows the
                     # previous configuration.
                     self._restore_reconfigure_state(previous)
+                    # The snapshot can revive a one-shot language restore
+                    # whose dictation was already stopped above; settle it
+                    # now so the shortcut language does not leak into the
+                    # next ordinary dictation (#805).
+                    self._restore_language_after_oneshot()
                     self._defer_download = True
                     try:
                         self._init_selected_engine()
@@ -3935,6 +4085,50 @@ class SpeechRecognitionManager:
             # If only VOSK params changed, just log it
             logger.info("Applied VAD/silence timeout changes.")
 
+    def _new_capture_source(self) -> Union[PortAudioCaptureSource, PipeWireCaptureSource]:
+        """Build the capture source matching the configured device."""
+        if is_pipewire_device(self.audio_device_index, self.audio_device_name):
+            return PipeWireCaptureSource(
+                device_index=self.audio_device_index,
+                device_name=self.audio_device_name,
+            )
+        return PortAudioCaptureSource(
+            device_index=self.audio_device_index,
+            device_name=self.audio_device_name,
+        )
+
+    def _capture_source_for_session(self) -> Union[PortAudioCaptureSource, PipeWireCaptureSource]:
+        """Return the session's capture source, creating one when absent.
+
+        Device selection is refreshed from the manager's configured device so
+        reconnections track the current setting. The source is rebuilt when
+        the configured device switched families (PortAudio <-> PipeWire).
+        """
+        want_pipewire = is_pipewire_device(
+            getattr(self, "audio_device_index", None),
+            getattr(self, "audio_device_name", None),
+        )
+        source = getattr(self, "_capture_source", None)
+        if source is None or isinstance(source, PipeWireCaptureSource) != want_pipewire:
+            source = self._new_capture_source()
+            self._capture_source = source
+        else:
+            source.device_index = getattr(self, "audio_device_index", None)
+            source.device_name = getattr(self, "audio_device_name", None)
+        return source
+
+    def _sync_capture_state(self) -> None:
+        """Mirror the capture source's state onto the manager's fields."""
+        source = getattr(self, "_capture_source", None)
+        if source is None:
+            return
+        self._audio_stream = source.stream
+        self._capture_sample_rate = source.sample_rate
+        self._capture_channels = source.channels
+        self._capture_downmix_channel = source.downmix_channel
+        if source.audio is not None:
+            self._pyaudio_instance = source.audio
+
     def _attempt_audio_reconnection(self, audio_instance) -> bool:
         """
         Attempt to reconnect to the audio device.
@@ -3945,8 +4139,6 @@ class SpeechRecognitionManager:
         Returns:
             bool: True if reconnection was successful, False otherwise
         """
-        import pyaudio
-
         self._reconnection_attempts += 1
 
         if self._reconnection_attempts > self._max_reconnection_attempts:
@@ -3964,81 +4156,27 @@ class SpeechRecognitionManager:
         # Wait before attempting reconnection
         time.sleep(delay)
 
-        try:
-            # Close existing stream if it exists
-            if self._audio_stream:
-                _safe_close_stream(self._audio_stream)
-                self._audio_stream = None
-
-            # Resolve a valid input device — by name first, then by index
-            use_system_default = self.audio_device_index is None and self.audio_device_name is None
-            if use_system_default:
-                resolved_device_index = None
-            else:
-                resolved_device_index = _resolve_device_by_name(
-                    audio_instance, self.audio_device_name, self.audio_device_index
-                )
-                if resolved_device_index is None:
-                    resolved_device_index = _resolve_valid_input_device(audio_instance, None)
-            if resolved_device_index is None and not use_system_default:
-                logger.warning(
-                    "Reconnection: no safe input devices enumerated; "
-                    "falling back to system default capture."
-                )
-                resolved_device_index = None
-
-            # Stream configuration
-            CHUNK = 1024
-            FORMAT = pyaudio.paInt16
-
-            # Negotiate the format and open the capture stream in ONE PortAudio
-            # open — Bluetooth SCO devices abort with heap corruption when the
-            # stream is opened, closed, and quickly reopened (issue #567).
-            CHANNELS, RATE, new_stream = _open_capture_stream(audio_instance, resolved_device_index)
-            logger.debug(f"Reconnecting with {CHANNELS} channel(s)")
-            self._capture_sample_rate = RATE
-            self._capture_channels = CHANNELS
-            self._capture_downmix_channel = None  # Reopened stream: clear speech-gated sticky
-            logger.debug(f"Reconnecting with sample rate: {RATE}Hz")
-
-            if new_stream is None:
-                # Negotiation failed; fall back to a plain open.
-                stream_kwargs = {
-                    "format": FORMAT,
-                    "channels": CHANNELS,
-                    "rate": RATE,
-                    "input": True,
-                    "frames_per_buffer": CHUNK,
-                }
-
-                # Use resolved device (skip if already system default)
+        source = self._capture_source_for_session()
+        # The source may not know about the stream it is asked to replace
+        # (e.g. when tests drive this method directly).
+        source.stream = getattr(self, "_audio_stream", None)
+        audio = audio_instance
+        if getattr(source, "requires_pyaudio", True) and audio is None:
+            # A session that started on a PipeWire sink never built a PyAudio
+            # instance; a PortAudio source still needs one to reopen.
+            audio = getattr(self, "_pyaudio_instance", None)
+            if audio is None:
                 try:
-                    default_idx = audio_instance.get_default_input_device_info().get("index")
-                except (IOError, OSError):
-                    default_idx = None
-                if resolved_device_index is not None and resolved_device_index != default_idx:
-                    stream_kwargs["input_device_index"] = resolved_device_index
+                    import pyaudio
 
-                new_stream = audio_instance.open(**stream_kwargs)
-
-            # Test the stream by reading a small amount of data
-            test_data = new_stream.read(CHUNK, exception_on_overflow=False)
-
-            if test_data:
-                self._audio_stream = new_stream
-                logger.info("Audio reconnection successful")
-                return True
-            else:
-                logger.error("Reconnected stream returned no data")
-                _safe_close_stream(new_stream)
-                return False
-
-        except (IOError, OSError) as e:
-            logger.error(f"Audio reconnection failed: {e}")
-            return False
-        except Exception as e:
-            logger.error(f"Unexpected error during audio reconnection: {e}")
-            return False
+                    audio = pyaudio.PyAudio()
+                    self._pyaudio_instance = audio
+                except (ImportError, OSError, AttributeError) as e:
+                    logger.error(f"Failed to initialize PyAudio for reconnection: {e}")
+                    return False
+        ok = source.reopen(audio)
+        self._sync_capture_state()
+        return ok
 
     def unload_model(self, reason: str = "auto_pause") -> None:
         """Stop recognition (if active) and release model resources from memory.
@@ -4051,6 +4189,7 @@ class SpeechRecognitionManager:
                   lazy-reload via :meth:`ensure_model_loaded`.
                 - ``"manual"`` / other: unload only without setting pause/idle flags.
         """
+        self._cancel_reload_recording()
         logger.info("Unloading speech model (reason=%s)", reason)
 
         if self.state != RecognitionState.IDLE:
@@ -4130,6 +4269,7 @@ class SpeechRecognitionManager:
 
         Also used after auto-pause / idle keep-alive to reload the model.
         """
+        self._cancel_reload_recording()
         logger.info("Reinitializing speech engine after system resume")
 
         if self.state != RecognitionState.IDLE:

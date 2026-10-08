@@ -123,10 +123,7 @@ class TestModelInfo(unittest.TestCase):
 
     def test_available_models_contains_all_models(self):
         """Test that AVAILABLE_MODELS contains all defined models."""
-        from vocalinux.utils.whispercpp_model_info import (
-            AVAILABLE_MODELS,
-            WHISPERCPP_MODEL_INFO,
-        )
+        from vocalinux.utils.whispercpp_model_info import AVAILABLE_MODELS, WHISPERCPP_MODEL_INFO
 
         self.assertEqual(set(AVAILABLE_MODELS), set(WHISPERCPP_MODEL_INFO.keys()))
 
@@ -164,6 +161,7 @@ class TestModelInfo(unittest.TestCase):
             "large-v3-turbo",
             "large-v3-turbo-q5_0",
             "large-v3-turbo-q8_0",
+            "small.en-tdrz",
         ]
 
         self.assertEqual(AVAILABLE_MODELS, expected_models)
@@ -173,6 +171,7 @@ class TestModelInfo(unittest.TestCase):
         from vocalinux.utils.whispercpp_model_info import (
             MODEL_SIZES,
             MODEL_VARIANTS_BY_SIZE,
+            NON_DICTATION_MODELS,
             WHISPERCPP_MODEL_INFO,
         )
 
@@ -185,11 +184,41 @@ class TestModelInfo(unittest.TestCase):
         grouped_models = {
             model_name for variants in MODEL_VARIANTS_BY_SIZE.values() for model_name in variants
         }
-        self.assertEqual(grouped_models, set(WHISPERCPP_MODEL_INFO.keys()))
+        self.assertEqual(grouped_models, set(WHISPERCPP_MODEL_INFO.keys()) - NON_DICTATION_MODELS)
         self.assertFalse(
             any(model_name.endswith("-tdrz") for model_name in grouped_models),
             "TinyDiarize needs diarization-specific runtime support, not the base dictation picker",
         )
+
+    def test_tdrz_model_is_catalogued_but_not_a_dictation_model(self):
+        """TinyDiarize is fetchable through the catalog, never dictation-selectable."""
+        from vocalinux.utils.whispercpp_model_info import (
+            NON_DICTATION_MODELS,
+            TDRZ_MODEL,
+            WHISPERCPP_MODEL_INFO,
+            is_dictation_model,
+            whispercpp_model_file,
+            whispercpp_model_source,
+        )
+
+        self.assertEqual(TDRZ_MODEL, "small.en-tdrz")
+        self.assertIn(TDRZ_MODEL, WHISPERCPP_MODEL_INFO)
+        self.assertIn(TDRZ_MODEL, NON_DICTATION_MODELS)
+        self.assertFalse(is_dictation_model(TDRZ_MODEL))
+        self.assertTrue(is_dictation_model("small.en"))
+        self.assertFalse(is_dictation_model("not-a-model"))
+
+        self.assertEqual(whispercpp_model_file(TDRZ_MODEL), "ggml-small.en-tdrz.bin")
+        url = WHISPERCPP_MODEL_INFO[TDRZ_MODEL]["url"]
+        self.assertIn("akashmjn/tinydiarize-whisper.cpp", url)
+        repo, revision = whispercpp_model_source(TDRZ_MODEL)
+        self.assertEqual(repo, "akashmjn/tinydiarize-whisper.cpp")
+        self.assertTrue(revision)
+        self.assertIn(f"/resolve/{revision}/", url)
+
+        main_repo, main_revision = whispercpp_model_source("small.en")
+        self.assertEqual(main_repo, "ggerganov/whisper.cpp")
+        self.assertEqual(main_revision, "")
 
     def test_model_variant_helpers_identify_size_and_english_only_variants(self):
         """Test helpers that drive the split whisper.cpp model selectors."""
@@ -575,10 +604,7 @@ class TestDetectVulkanSupport(unittest.TestCase):
             return MagicMock(returncode=1, stdout="")
 
         with patch("subprocess.run", side_effect=run_side_effect):
-            from vocalinux.utils.whispercpp_model_info import (
-                ComputeBackend,
-                detect_compute_backend,
-            )
+            from vocalinux.utils.whispercpp_model_info import ComputeBackend, detect_compute_backend
 
             backend, backend_info = detect_compute_backend()
             self.assertEqual(backend, ComputeBackend.VULKAN)
@@ -745,10 +771,7 @@ class TestDetectComputeBackend(unittest.TestCase):
             mock_vulkan.return_value = (True, "Intel Arc GPU")
             mock_cuda.return_value = (True, "NVIDIA RTX 3080 (10GB)")
 
-            from vocalinux.utils.whispercpp_model_info import (
-                ComputeBackend,
-                detect_compute_backend,
-            )
+            from vocalinux.utils.whispercpp_model_info import ComputeBackend, detect_compute_backend
 
             backend, info = detect_compute_backend()
 
@@ -764,10 +787,7 @@ class TestDetectComputeBackend(unittest.TestCase):
             mock_vulkan.return_value = (False, None)
             mock_cuda.return_value = (True, "NVIDIA RTX 3080 (10GB)")
 
-            from vocalinux.utils.whispercpp_model_info import (
-                ComputeBackend,
-                detect_compute_backend,
-            )
+            from vocalinux.utils.whispercpp_model_info import ComputeBackend, detect_compute_backend
 
             backend, info = detect_compute_backend()
 
@@ -785,10 +805,7 @@ class TestDetectComputeBackend(unittest.TestCase):
             mock_cuda.return_value = (False, None)
             mock_cpu.return_value = "Intel Core i7"
 
-            from vocalinux.utils.whispercpp_model_info import (
-                ComputeBackend,
-                detect_compute_backend,
-            )
+            from vocalinux.utils.whispercpp_model_info import ComputeBackend, detect_compute_backend
 
             backend, info = detect_compute_backend()
 
@@ -948,6 +965,106 @@ class TestGetRecommendedModel(unittest.TestCase):
                 self.assertIsInstance(reason, str)
                 self.assertGreater(len(reason), 0)
 
+    def test_parse_cuda_vram_mib_and_gb(self):
+        """nvidia-smi reports MiB; older mocks used GB. Both must parse."""
+        from vocalinux.utils.whispercpp_model_info import _parse_cuda_vram_gib
+
+        self.assertEqual(_parse_cuda_vram_gib("NVIDIA GeForce RTX 3060 (6144 MiB)"), 6.0)
+        self.assertEqual(_parse_cuda_vram_gib("NVIDIA GeForce RTX 3070 (8192 MiB)"), 8.0)
+        self.assertEqual(_parse_cuda_vram_gib("NVIDIA RTX 4090 (24GB)"), 24.0)
+        self.assertEqual(_parse_cuda_vram_gib("NVIDIA RTX 3080 (10 GB)"), 10.0)
+        self.assertEqual(_parse_cuda_vram_gib("NVIDIA RTX 3060 (8 GiB)"), 8.0)
+        self.assertEqual(_parse_cuda_vram_gib("NVIDIA GTX 1650 (4096 MB)"), 4.0)
+        self.assertIsNone(_parse_cuda_vram_gib("NVIDIA GPU"))
+        self.assertIsNone(_parse_cuda_vram_gib(""))
+
+    def test_get_recommended_model_with_cuda_mib_medium(self):
+        """8 GiB of CUDA VRAM reported as MiB must recommend medium."""
+        mock_psutil = MagicMock()
+        mock_psutil.virtual_memory.return_value = MagicMock(total=16 * (1024**3))
+
+        with patch.dict("sys.modules", {"psutil": mock_psutil}):
+            with patch(
+                "vocalinux.utils.whispercpp_model_info.detect_compute_backend"
+            ) as mock_backend:
+                mock_backend.return_value = ("cuda", "NVIDIA GeForce RTX 3070 (8192 MiB)")
+
+                from vocalinux.utils.whispercpp_model_info import get_recommended_model
+
+                model, reason = get_recommended_model()
+
+                self.assertEqual(model, "medium")
+                self.assertIn("VRAM", reason)
+
+    def test_get_recommended_model_with_cuda_mib_small(self):
+        """6 GiB of CUDA VRAM reported as MiB must recommend small."""
+        mock_psutil = MagicMock()
+        mock_psutil.virtual_memory.return_value = MagicMock(total=16 * (1024**3))
+
+        with patch.dict("sys.modules", {"psutil": mock_psutil}):
+            with patch(
+                "vocalinux.utils.whispercpp_model_info.detect_compute_backend"
+            ) as mock_backend:
+                mock_backend.return_value = ("cuda", "NVIDIA GeForce RTX 3060 (6144 MiB)")
+
+                from vocalinux.utils.whispercpp_model_info import get_recommended_model
+
+                model, reason = get_recommended_model()
+
+                self.assertEqual(model, "small")
+
+    def test_get_recommended_model_with_cuda_mib_base(self):
+        """Low CUDA VRAM reported as MiB must recommend base."""
+        mock_psutil = MagicMock()
+        mock_psutil.virtual_memory.return_value = MagicMock(total=8 * (1024**3))
+
+        with patch.dict("sys.modules", {"psutil": mock_psutil}):
+            with patch(
+                "vocalinux.utils.whispercpp_model_info.detect_compute_backend"
+            ) as mock_backend:
+                mock_backend.return_value = ("cuda", "NVIDIA GeForce GTX 1050 (2048 MiB)")
+
+                from vocalinux.utils.whispercpp_model_info import get_recommended_model
+
+                model, reason = get_recommended_model()
+
+                self.assertEqual(model, "base")
+
+    def test_get_recommended_model_with_cuda_unparseable_vram_falls_back(self):
+        mock_psutil = MagicMock()
+        mock_psutil.virtual_memory.return_value = MagicMock(total=16 * (1024**3))
+
+        with patch.dict("sys.modules", {"psutil": mock_psutil}):
+            with patch(
+                "vocalinux.utils.whispercpp_model_info.detect_compute_backend"
+            ) as mock_backend:
+                mock_backend.return_value = ("cuda", "NVIDIA GPU")
+
+                from vocalinux.utils.whispercpp_model_info import get_recommended_model
+
+                model, reason = get_recommended_model()
+
+                self.assertEqual(model, "small")
+                self.assertIn("CUDA GPU detected", reason)
+
+    def test_get_recommended_model_vulkan_ceils_fractional_ram(self):
+        """~7.4 GiB must count as 8 GiB so Vulkan recommends small, not base."""
+        mock_psutil = MagicMock()
+        mock_psutil.virtual_memory.return_value = MagicMock(total=int(7.4 * (1024**3)))
+
+        with patch.dict("sys.modules", {"psutil": mock_psutil}):
+            with patch(
+                "vocalinux.utils.whispercpp_model_info.detect_compute_backend"
+            ) as mock_backend:
+                mock_backend.return_value = ("vulkan", "Intel Arc A770")
+
+                from vocalinux.utils.whispercpp_model_info import get_recommended_model
+
+                model, reason = get_recommended_model()
+
+                self.assertEqual(model, "small")
+                self.assertIn("8GB", reason)
+
 
 class TestGetModelPath(unittest.TestCase):
     """Test cases for get_model_path function."""
@@ -1048,10 +1165,7 @@ class TestGetBackendDisplayName(unittest.TestCase):
 
     def test_get_backend_display_name_returns_string(self):
         """Test that get_backend_display_name returns a string."""
-        from vocalinux.utils.whispercpp_model_info import (
-            ComputeBackend,
-            get_backend_display_name,
-        )
+        from vocalinux.utils.whispercpp_model_info import ComputeBackend, get_backend_display_name
 
         result = get_backend_display_name(ComputeBackend.CPU)
         self.assertIsInstance(result, str)
@@ -1059,30 +1173,21 @@ class TestGetBackendDisplayName(unittest.TestCase):
 
     def test_get_backend_display_name_vulkan(self):
         """Test display name for Vulkan backend."""
-        from vocalinux.utils.whispercpp_model_info import (
-            ComputeBackend,
-            get_backend_display_name,
-        )
+        from vocalinux.utils.whispercpp_model_info import ComputeBackend, get_backend_display_name
 
         result = get_backend_display_name(ComputeBackend.VULKAN)
         self.assertEqual(result, "Vulkan GPU")
 
     def test_get_backend_display_name_cuda(self):
         """Test display name for CUDA backend."""
-        from vocalinux.utils.whispercpp_model_info import (
-            ComputeBackend,
-            get_backend_display_name,
-        )
+        from vocalinux.utils.whispercpp_model_info import ComputeBackend, get_backend_display_name
 
         result = get_backend_display_name(ComputeBackend.CUDA)
         self.assertEqual(result, "NVIDIA CUDA")
 
     def test_get_backend_display_name_cpu(self):
         """Test display name for CPU backend."""
-        from vocalinux.utils.whispercpp_model_info import (
-            ComputeBackend,
-            get_backend_display_name,
-        )
+        from vocalinux.utils.whispercpp_model_info import ComputeBackend, get_backend_display_name
 
         result = get_backend_display_name(ComputeBackend.CPU)
         self.assertEqual(result, "CPU")

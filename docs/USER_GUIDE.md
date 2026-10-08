@@ -34,6 +34,8 @@ When Vocalinux injects through the clipboard (the usual Wayland / ydotool path),
 
 On non-US layouts such as German Neo, that chord uses the key that types **v** on the active layout (not physical KEY_V). Nested terminal panels inside an IDE are often invisible to window-class detection. If paste lands as a literal `^V` or does nothing, open **Settings → Dictation → Clipboard Paste Shortcut** and choose **Ctrl+Shift+V**.
 
+**Other audio.** Settings → Audio → Other audio can lower speakers and headphones while the microphone is open, then put that volume back. It stays off until you turn it on. Level while dictating is a percent of the current volume (0 is silent). Quitting mid-dictation puts the volume back; if the app crashes first, the next launch does.
+
 ## Shortcuts
 
 Configure under **Settings → Shortcuts**:
@@ -85,6 +87,72 @@ Open **Settings → Speech Model**. The page starts with a simple setup (languag
 
 Parakeet runs NVIDIA NeMo ASR models through sherpa-onnx. The default bundle is **v3-european** (25 European languages). **v2-english** is English-only. Parakeet ignores the catalog language picker (language is treated as auto).
 
+### Language
+
+Pick the language you dictate in from **Language**, or leave it on auto-detect.
+
+If you work in more than one language and switch keyboard layouts to do it, turn
+on **Follow keyboard layout** instead. Vocalinux then reads your active layout at
+the start of every dictation and uses the matching language, so switching layout
+switches dictation language with it. The Language picker greys out while this is
+on and shows what your current layout resolves to; turning it off pins that
+language.
+
+Available for whisper.cpp, Whisper, Faster Whisper, and Remote API. VOSK loads a
+separate model per language, so following a layout would mean a model reload on
+the hotkey; Parakeet does not use the language picker at all. Active-layout
+detection uses GNOME's input-source settings; on other desktops it falls back to
+the configured primary layout.
+
+### Activation via a KDE Plasma global shortcut
+
+Instead of the built-in hotkey listener, you can let your desktop's global
+shortcut system trigger Vocalinux. On Wayland the built-in listener reads
+`/dev/input` (requiring membership in the `input` group and effectively acting
+as a system-wide key reader). Delegating activation to the compositor avoids
+this entirely: no `/dev/input` access and no `input` group needed just to
+start/stop dictation. Text injection is unaffected.
+
+Enable it in Vocalinux:
+
+1. Open **Settings → Shortcuts** (the Keyboard Shortcuts group on the Dictation page)
+2. Turn on **External Activation (Desktop Shortcut)**
+
+The change applies immediately; you do not need to restart. The built-in key
+listener stops, and a running instance exposes a D-Bus service on the session
+bus (`com.vocalinux.Vocalinux`). The CLI can forward commands to it:
+
+```bash
+vocalinux --toggle   # start if idle, stop if active
+vocalinux --start    # start voice typing
+vocalinux --stop     # stop voice typing
+```
+
+Then bind a compositor shortcut to `vocalinux --toggle`. On KDE Plasma:
+
+1. Open **System Settings -> Keyboard -> Shortcuts -> Add New -> Command or Script**
+   (older Plasma: **System Settings -> Shortcuts -> Custom Shortcuts -> Edit ->
+   New -> Global Shortcut -> Command/URL**).
+
+2. Bind a key combination of your choice to the command `vocalinux --toggle`.
+
+Now your chosen key combination toggles dictation, handled by the compositor
+rather than by Vocalinux reading the keyboard directly. This works the same way
+on other compositors that support binding a key to a command (e.g. GNOME custom
+shortcuts, Sway/Hyprland `bindsym`/`bind`).
+
+As an advanced alternative, you can set the same option in
+`~/.config/vocalinux/config.json` under `shortcuts`:
+
+```json
+"shortcuts": {
+    "disable_internal_hotkey": true
+}
+```
+
+Quit Vocalinux before editing that file so the running app cannot overwrite
+the edit from its cached config. Start Vocalinux again after saving.
+
 ### Model size (whisper.cpp / Whisper)
 
 | Size | Approx. size | Tradeoff |
@@ -114,6 +182,13 @@ Under Settings:
 - **Auto-pause apps**: unload the model while listed apps run
 - **Model keep-alive**: unload after idle timeout to free GPU/CPU
 
+In **Settings → Performance → Unload When Idle**, enable **Record while model
+reloads** to speak as soon as you press the dictation shortcut. Audio stays in
+memory while the model loads, then joins the rest of the recording for
+transcription. Releasing the shortcut before loading finishes still submits the
+recorded speech. Wait for that transcription to finish before starting another
+recording. This option is off by default.
+
 ## Tips for better recognition
 
 1. Use a decent microphone and reduce background noise when you can
@@ -134,7 +209,67 @@ vocalinux --engine parakeet
 vocalinux --model medium.en-q5_0
 vocalinux --wayland
 vocalinux --start-minimized
+vocalinux --transcribe-file meeting.wav   # diarized transcript on stdout, then exits
 ```
+
+## Custom Dictionary Support
+
+Open **Settings → Custom Dictionary** to configure two separate capabilities:
+
+- **Custom terms** bias recognition toward product names, people, and jargon.
+  They are read from `~/.config/vocalinux/dictionary.txt` by default, as UTF-8
+  with one term per line. Blank lines and `#` comments are allowed, so the same
+  file remains friendly to an accessibility scanner. Use the add/remove editor
+  or choose a different readable terms file with the file picker.
+- **Transcript corrections** replace a known misheard word or phrase after
+  transcription, for example `super base` with `Supabase`. Corrections are
+  stored separately in `~/.config/vocalinux/custom-dictionary-corrections.json`.
+
+VocaLinux re-reads both files before each completed dictation segment, so an
+external edit applies to the next segment without restarting the app. Vocabulary
+bias works with Whisper, whisper.cpp, and Faster Whisper. Corrections work with
+every engine, including VOSK, Parakeet, and the configured remote API.
+
+Corrections run before voice-command interpretation. This can prevent a
+command-like misrecognition from acting, but avoid replacements that create a
+voice command unless that is intentional. Correction replacements are not
+automatically added to recognition bias.
+
+For a one-session terms override, start Vocalinux with:
+
+```bash
+vocalinux --dictionary-file /path/to/dictionary.txt
+```
+
+This temporarily enables terms from that file without changing saved settings;
+the Custom terms controls are disabled for the session. It does not disable
+transcript corrections.
+
+`--transcribe-file` uses the TinyDiarize model (`small.en-tdrz`) and needs it downloaded first — the tray "Transcribe Audio File…" entry fetches it on demand.
+
+### Post-Processing
+
+Vocalinux can pipe each transcription result through a user-defined script before injecting it into your application. This lets you apply custom transformations — for example, grammar correction, abbreviation expansion, or domain-specific formatting.
+
+**To configure:**
+1. Open Settings from the tray icon menu (right-click)
+2. Go to the **Post-Processing** tab
+3. Enter the path to your script, or click **Browse…** to select it
+4. Leave the field empty to disable post-processing
+
+**Script contract:**
+- The script receives the transcription on **stdin**
+- It must write the replacement text to **stdout**
+- stdout is injected verbatim — trailing newlines are preserved (e.g. paragraph breaks), except a single trailing newline that line-oriented tools like `echo` add when the transcription had none
+- A non-zero exit code or a script that times out (10 s) causes the original text to be used unchanged
+- Scripts run on a dedicated worker so a slow script cannot interrupt dictation
+
+**Example** — a shell script that uppercases everything:
+```bash
+#!/bin/bash
+tr '[:lower:]' '[:upper:]'
+```
+Make the script executable (`chmod +x`) before setting the path in Vocalinux.
 
 ## Troubleshooting
 
@@ -143,3 +278,68 @@ vocalinux --debug
 ```
 
 See [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for tray, audio, injection, and model issues. Distro notes: [DISTRO_COMPATIBILITY.md](DISTRO_COMPATIBILITY.md). Updates: [UPDATE.md](UPDATE.md). Help channels: [SUPPORT.md](../SUPPORT.md).
+
+### Text injection backend
+
+Vocalinux types your dictated text using one of several backends. It picks one
+automatically, and on most desktops the automatic choice is correct.
+
+Autodetection can be wrong, though, and it fails in a way that is easy to
+misread: on a compositor that does not relay IBus commits to native Wayland
+applications, IBus reports the text as delivered while nothing appears. If
+dictation works in some windows (typically XWayland ones, like a browser) but
+silently does nothing in others, that is the symptom.
+
+Pin the backend explicitly in `~/.config/vocalinux/config.json`:
+
+```json
+{
+  "text_injection": {
+    "backend": "wtype"
+  }
+}
+```
+
+| Value | Backend |
+|---|---|
+| `auto` | Autodetect (default; autodetection may select IBus) |
+| `ibus` | IBus input method; on Wayland, bypasses compositor checks and may silently do nothing in native Wayland apps |
+| `portal` | RemoteDesktop portal (Wayland; the sandboxed path, asks for permission once, works under Flatpak) |
+| `wtype` | wtype virtual keyboard (Wayland) |
+| `ydotool` | ydotool uinput (Wayland; needs `ydotoold`) |
+| `xdotool` | xdotool (X11). On Wayland it only turns IBus off -- the Wayland tool is still picked automatically |
+
+The setting takes effect on the next start. `auto` leaves normal autodetection
+in place and may select IBus. An explicit non-IBus pin (`portal`, `wtype`,
+`ydotool`, or `xdotool`) skips IBus selection.
+
+On Wayland, when IBus is not selected, autodetection tries the RemoteDesktop
+portal first -- it is the only injection path Wayland officially supports and
+it needs no uinput device or helper daemon -- then `ydotool`, `wtype`, and
+finally `xdotool` under XWayland.
+
+On X11 the injection tool is `xdotool` regardless of which non-`ibus` value you
+pin, so `xdotool` is the name to use there when IBus is unreliable in a
+particular application. Pinning `ibus` keeps the IBus path; pinning anything
+else turns it off.
+
+To try a backend for a single run without changing the saved setting, set
+`VOCALINUX_FORCE_BACKEND`, which overrides the config value. Set it to `auto`
+to ignore a saved pin for that run:
+
+```bash
+VOCALINUX_FORCE_BACKEND=wtype vocalinux --debug
+```
+
+The setting and environment override are read at startup, so restart Vocalinux
+after editing `config.json`. The startup log first records a backend pin request;
+it does not prove the backend was available or that text reached the focused
+application. Later logs identify a fallback when a pin was not applied.
+
+If a pinned tool is unavailable, Vocalinux warns and continues with its normal
+fallback selection. `portal` needs a desktop implementing the
+`org.freedesktop.portal.RemoteDesktop` interface (GNOME and KDE Plasma do;
+most wlroots compositors do not). `ydotool` also needs a usable `/dev/uinput`
+and a working `ydotoold` setup. `xdotool` types into X11/XWayland windows,
+not native Wayland windows. A live test in the target application is still the
+final confirmation that text is delivered.

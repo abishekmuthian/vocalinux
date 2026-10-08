@@ -200,6 +200,18 @@ class TestFasterWhisperModelInfo:
                 model, _reason = get_recommended_model()
                 assert model == "base"
 
+    def test_get_recommended_model_cuda_ceils_fractional_ram(self):
+        """~7.4 GiB must count as 8 GiB so CUDA recommends small, not base."""
+        with patch(
+            "vocalinux.utils.faster_whisper_model_info._has_torch_cuda",
+            return_value=True,
+        ):
+            with patch("psutil.virtual_memory") as mock_mem:
+                mock_mem.return_value.total = int(7.4 * 1024**3)
+                model, reason = get_recommended_model()
+                assert model == "small"
+                assert "8GB" in reason
+
     def test_has_torch_cuda_available(self):
         """Test that torch detection reports CUDA availability."""
         from vocalinux.utils.faster_whisper_model_info import _has_torch_cuda
@@ -310,6 +322,21 @@ class TestFasterWhisperEngine:
             text = engine.transcribe(audio_bytes)
 
             assert text == "Hello, world."
+
+    def test_transcribe_passes_initial_prompt(self) -> None:
+        """Test that vocabulary bias is forwarded to faster-whisper."""
+        whisper_mock = self._mock_whisper_model([MagicMock(text="VocaLinux")])
+        with patch.dict(sys.modules, {"faster_whisper": whisper_mock}):
+            engine = FasterWhisperEngine(model_size="tiny", device="cpu")
+            engine.init()
+
+            audio = np.array([0, 1000, -1000, 0], dtype=np.int16)
+            engine.transcribe([audio.tobytes()], initial_prompt="VocaLinux")
+
+            assert (
+                whisper_mock.WhisperModel.return_value.transcribe.call_args.kwargs["initial_prompt"]
+                == "VocaLinux"
+            )
 
     def test_transcribe_empty_audio(self):
         """Test that empty audio returns empty text."""

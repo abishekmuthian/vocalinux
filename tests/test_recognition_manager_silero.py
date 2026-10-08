@@ -12,6 +12,7 @@ returning scripted speech probabilities. Verifies:
 """
 
 import sys
+import time
 import unittest  # noqa: E402
 from unittest.mock import MagicMock, patch  # noqa: E402
 
@@ -39,9 +40,7 @@ if "gi.repository" not in sys.modules:
     sys.modules["gi.repository"] = MagicMock()
 
 from vocalinux.common_types import RecognitionState  # noqa: E402
-from vocalinux.speech_recognition.recognition_manager import (  # noqa: E402
-    SpeechRecognitionManager,
-)
+from vocalinux.speech_recognition.recognition_manager import SpeechRecognitionManager  # noqa: E402
 
 for _k, _v in _ORIG_MODULES.items():
     if _v is not None:
@@ -201,7 +200,7 @@ class TestRecordAudioSileroPath(unittest.TestCase):
         with (
             patch.dict(sys.modules, {"pyaudio": pyaudio_mod, "numpy": np}),
             patch(
-                "vocalinux.speech_recognition.recognition_manager._open_capture_stream",
+                "vocalinux.audio.capture._open_capture_stream",
                 return_value=(channels, rate, stream),
             ),
         ):
@@ -234,6 +233,66 @@ class TestRecordAudioSileroPath(unittest.TestCase):
         # but speech_counter never accumulates -> no flush.
         self._drive(probs=[0.95] * 20, vad_sensitivity=3)
         self.assertEqual(len(self.enqueued), 0, "speech should keep silence counter at 0, no flush")
+
+    def test_reload_keeps_speech_across_silence(self) -> None:
+        """Speech during reload stays together despite intervening silence."""
+        self.mgr._reload_pending = True
+        self._drive(probs=[0.95] * 6 + [0.05] * 20)
+        self.assertEqual(self.enqueued, [])
+        self.assertEqual(len(self.mgr.audio_buffer), 26)
+        self.assertTrue(self.mgr._recording_segment_has_speech)
+
+    def test_reload_buffer_limit_reports_error_without_trimming_speech(self) -> None:
+        """A stalled load must not silently discard the start of an utterance."""
+        self.mgr._reload_pending = True
+        self.mgr._buffered_reload_session = True
+        self.mgr._max_buffer_size = 4
+        self._drive(probs=[0.95] * 20)
+        self.assertEqual(len(self.mgr.audio_buffer), 4)
+        self.assertTrue(self.mgr._buffered_capture_failed)
+        self.assertEqual(self.mgr.state, RecognitionState.ERROR)
+
+    def test_reload_reconnection_failure_marks_capture_failed(self) -> None:
+        """Losing the microphone during reload must fail instead of dropping audio."""
+        self.mgr._buffered_reload_session = True
+        stream = MagicMock()
+        stream.read.side_effect = OSError("microphone disconnected")
+        pyaudio_mod, _audio = _make_pyaudio_module(stream)
+
+        with (
+            patch.dict(sys.modules, {"pyaudio": pyaudio_mod, "numpy": np}),
+            patch(
+                "vocalinux.speech_recognition.recognition_manager._open_capture_stream",
+                return_value=(1, 16000, stream),
+            ),
+            patch.object(self.mgr, "_attempt_audio_reconnection", return_value=False),
+        ):
+            self.mgr._record_audio()
+
+        self.assertTrue(self.mgr._buffered_capture_failed)
+        self.assertEqual(self.mgr.state, RecognitionState.ERROR)
+
+    def test_reload_rapid_audio_error_marks_capture_failed(self) -> None:
+        """A repeated microphone error during reload must fail the capture."""
+        self.mgr._buffered_reload_session = True
+        self.mgr._last_audio_error_time = time.time()
+        stream = MagicMock()
+        stream.read.side_effect = OSError("microphone still disconnected")
+        pyaudio_mod, _audio = _make_pyaudio_module(stream)
+
+        with (
+            patch.dict(sys.modules, {"pyaudio": pyaudio_mod, "numpy": np}),
+            patch(
+                "vocalinux.speech_recognition.recognition_manager._open_capture_stream",
+                return_value=(1, 16000, stream),
+            ),
+            patch.object(self.mgr, "_attempt_audio_reconnection") as reconnect,
+        ):
+            self.mgr._record_audio()
+
+        reconnect.assert_not_called()
+        self.assertTrue(self.mgr._buffered_capture_failed)
+        self.assertEqual(self.mgr.state, RecognitionState.ERROR)
 
     def test_sensitivity_lowest_blocks_borderline_speech(self):
         """At sensitivity=1 (threshold 0.8), prob=0.6 is silence."""
@@ -308,11 +367,11 @@ class TestRecordAudioAmplitudeFallback(unittest.TestCase):
         with (
             patch.dict(sys.modules, {"pyaudio": pyaudio_mod, "numpy": np}),
             patch(
-                "vocalinux.speech_recognition.recognition_manager._get_supported_channels",
+                "vocalinux.audio.capture._get_supported_channels",
                 return_value=1,
             ),
             patch(
-                "vocalinux.speech_recognition.recognition_manager._get_supported_sample_rate",
+                "vocalinux.audio.capture._get_supported_sample_rate",
                 return_value=16000,
             ),
         ):
@@ -368,11 +427,11 @@ class TestAudioLevelCallback(unittest.TestCase):
         with (
             patch.dict(sys.modules, {"pyaudio": pyaudio_mod, "numpy": np}),
             patch(
-                "vocalinux.speech_recognition.recognition_manager._get_supported_channels",
+                "vocalinux.audio.capture._get_supported_channels",
                 return_value=1,
             ),
             patch(
-                "vocalinux.speech_recognition.recognition_manager._get_supported_sample_rate",
+                "vocalinux.audio.capture._get_supported_sample_rate",
                 return_value=16000,
             ),
         ):

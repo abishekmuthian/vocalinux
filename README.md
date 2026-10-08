@@ -33,18 +33,18 @@ Vocalinux turns speech into typed text in whatever app has focus. It is a free, 
 
 No Voca account is required. Models download once. After that, speech-to-text stays on your machine.
 
-**Current release:** [v0.17.0](https://github.com/VocaHQ/vocalinux/releases/tag/v0.17.0). Minor: Faster Whisper and Parakeet engines, Speech Model simple setup, first-run system language, Snap with native Wayland typing, Flatpak bundles on the GitHub Release. Details: [docs/UPDATE.md](docs/UPDATE.md).
+**Current release:** [v0.18.1](https://github.com/VocaHQ/vocalinux/releases/tag/v0.18.1). Patch: Settings Proxy page for downloads and update checks, opt-in transcript persistence to disk, .deb and .rpm release packages, a slimmer tray menu, and a round of Wayland, keyboard-discovery, and model-picker reliability fixes. Details: [docs/UPDATE.md](docs/UPDATE.md).
 
 ## Features
 
 - **On-device after model download**: Local engines; speech-to-text stays on your machine
 - **X11 and Wayland**: Text injection via xdotool, IBus, wtype, ydotool, or clipboard fallback
-- **Several engines**: whisper.cpp (default), OpenAI Whisper, Faster Whisper, VOSK, Parakeet, plus optional remote HTTP API
+- **Several engines**: whisper.cpp (default), OpenAI Whisper, Faster Whisper, VOSK, Parakeet, plus optional remote HTTP API or local VocaGateway from Settings (not on-device)
 - **GPU acceleration**: Vulkan for AMD, Intel, and NVIDIA with whisper.cpp
 - **Toggle or push-to-talk**: New installs default to hold Right Alt; existing configs keep their shortcut
 - **System tray + settings**: Searchable sidebar, Speech Model simple setup with Advanced as an island, status icons, audio feedback
 - **Start on login**: XDG autostart (desktop session, not a systemd service)
-- **Packaging**: install script, AppImage, AUR, PyPI, Snap (`--edge`), Flatpak (release bundles and local build; not on Flathub)
+- **Packaging**: install script, `.deb` / `.rpm`, AppImage, AUR, PyPI, Snap (`--edge`), Flatpak (release bundles and local build; not on Flathub)
 
 ## Screenshots
 
@@ -106,6 +106,16 @@ Vocalinux in action. Full gallery on the [website screenshots page](https://voca
       <em>Advanced</em>
     </td>
   </tr>
+  <tr>
+    <td align="center">
+      <img src="web/public/screenshots/06-dictation-overlay-listening.png" alt="Dictation overlay listening" width="96"><br>
+      <em>Floating overlay while listening (green)</em>
+    </td>
+    <td align="center">
+      <img src="web/public/screenshots/07-dictation-overlay-processing.png" alt="Dictation overlay processing" width="96"><br>
+      <em>Floating overlay while processing (amber)</em>
+    </td>
+  </tr>
 </table>
 
 ## Install
@@ -140,7 +150,7 @@ bash /tmp/vl.sh --auto --engine=vosk                # VOSK only
 bash /tmp/vl.sh --auto --engine=parakeet            # Parakeet (CPU)
 ```
 
-For a specific release tag, see [GitHub Releases](https://github.com/VocaHQ/vocalinux/releases) or `./install.sh --tag=v0.17.0`.
+For a specific release tag, see [GitHub Releases](https://github.com/VocaHQ/vocalinux/releases) or `./install.sh --tag=v0.18.1`.
 
 ### Arch Linux (AUR)
 
@@ -154,15 +164,33 @@ See [docs/AUR.md](docs/AUR.md).
 
 Download the `x86_64` or `aarch64` AppImage from [Releases](https://github.com/VocaHQ/vocalinux/releases), mark it executable, and run it. Built against glibc 2.35 (Debian 12+, Ubuntu 22.04+, Fedora 36+, Arch, Tumbleweed). Host text-injection tools (`xdotool` on X11; `wtype` / `ydotool` / clipboard tools on Wayland) are still required. Current AppImages rebuild whisper.cpp with Vulkan and use the host GPU driver. Prefer the installer when you want system deps, a CUDA build, and models set up automatically.
 
+### Distro packages (.deb / .rpm)
+
+Download the `.deb` (Debian 12+, Ubuntu 24.04+) or `.rpm` (Fedora) matching your CPU from [Releases](https://github.com/VocaHQ/vocalinux/releases) and install with `sudo apt install ./vocalinux_*.deb` or `sudo dnf install ./vocalinux-*.rpm`. Thin packages: Python and GTK come from the distro. No auto-update; CPU whisper.cpp. Details in [docs/INSTALL.md](docs/INSTALL.md).
+
 ### Flatpak (any distro)
 
-GitHub Releases attach `Vocalinux-<version>-x86_64.flatpak` and `Vocalinux-<version>-aarch64.flatpak`. After the Flathub GNOME runtime is present:
+Install and auto-update via the self-hosted VocaHQ remote (`flatpak update` picks up each release):
+
+```bash
+flatpak install https://vocahq.github.io/vocalinux-flatpak/com.vocalinux.Vocalinux.flatpakref
+```
+
+The `.flatpakref` adds the `vocahq` remote and resolves the GNOME runtime through Flathub. Manually instead:
+
+```bash
+flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+flatpak remote-add --if-not-exists vocahq https://vocahq.github.io/vocalinux-flatpak/vocahq.flatpakrepo
+flatpak install vocahq com.vocalinux.Vocalinux
+```
+
+Or sideload a GitHub Release bundle (`Vocalinux-<version>-x86_64.flatpak` or `-aarch64.flatpak`) after the Flathub GNOME runtime is present — bundles do not auto-update:
 
 ```bash
 flatpak install --user ./Vocalinux-<version>-x86_64.flatpak
 ```
 
-Bundles do not auto-update. Local build:
+Local build:
 
 ```bash
 flatpak install flathub org.gnome.Platform//50 org.gnome.Sdk//50
@@ -175,16 +203,24 @@ Ships whisper.cpp with Vulkan. It is **not on Flathub** (submission [flathub#936
 
 ### Snap (Ubuntu Snap Store)
 
-Listing: [snapcraft.io/vocalinux](https://snapcraft.io/vocalinux). `stable` is still a manual promote after QA.
+Listing: [snapcraft.io/vocalinux](https://snapcraft.io/vocalinux). `stable` is promoted from `candidate` after QA. Tagged releases also attach `vocalinux_<version>_amd64.snap` on GitHub.
 
 ```bash
 sudo snap install vocalinux --edge
 sudo snap connect vocalinux:audio-record   # if mic is not auto-connected
 sudo snap connect vocalinux:raw-input      # global keyboard shortcuts (evdev)
+sudo snap connect vocalinux:hardware-observe  # list keyboards (/proc/bus/input/devices)
 sudo snap connect vocalinux:uinput         # native Wayland typing (ydotool)
 ```
 
-v0.17.0 includes ydotool and the `uinput` plug. The Store still has to finish review of that plug, so `snap info vocalinux` may still show **v0.16.2** (rev 7) on edge. That revision has no `uinput` plug; `snap connect vocalinux:uinput` fails until a 0.17.0+ revision is listed.
+v0.18.1 includes ydotool and the `uinput` plug. The Store still has to finish review of that plug, so `snap info vocalinux` may still show **v0.16.2** (rev 7) on edge. That revision has no `uinput` plug; `snap connect vocalinux:uinput` fails until a 0.18.0+ revision is listed.
+
+Until then, sideload the GitHub file:
+
+```bash
+sudo snap install --dangerous ./vocalinux_0.18.1_amd64.snap
+sudo snap connect vocalinux:uinput
+```
 
 ### From source
 
@@ -274,7 +310,7 @@ vocalinux --start-minimized
 
 ### Configuration
 
-Stored at `~/.config/vocalinux/config.json`. Prefer the Settings dialog for day-to-day changes. **Settings → Speech Model** starts with a simple setup; expand **Advanced** for engine, size, and specialization.
+Stored at `~/.config/vocalinux/config.json`. Prefer the Settings dialog for day-to-day changes. **Settings → Speech Model** starts with a simple setup; expand **Advanced** for engine, size, and specialization. Set `post_processing.script_path` to an executable to transform each transcription result (stdin → stdout) before it is injected; leave empty to disable.
 
 Neural VAD (Silero) is used when `onnxruntime` is available; install via `pip install "vocalinux[vad]"` for manual/PyPI installs. The installer attempts this automatically.
 
@@ -291,6 +327,7 @@ Neural VAD (Silero) is used when `onnxruntime` is available; install via `pip in
 | [Support](SUPPORT.md) | Where to get help |
 | [Distribution compatibility](docs/DISTRO_COMPATIBILITY.md) | Distro matrix and session notes |
 | [Remote HTTP API](docs/HTTP_REMOTE.md) | Offload transcription to a server |
+| [Local VocaGateway (optional)](docs/GATEWAY_EMBED.md) | Start a local gateway from Settings; not on-device |
 | [Contributing](CONTRIBUTING.md) | Dev setup, style, PR process |
 | [Security](SECURITY.md) | Supported versions and vulnerability reporting |
 | [Docs index](docs/README.md) | Full documentation map |
@@ -318,12 +355,11 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the two-venv layout, `just` recipes, 
 
 ## Roadmap
 
-Shipped: graphical settings, multi-language support, whisper.cpp default, Vulkan GPU, Wayland/IBus, Flatpak packaging, AppImage, in-app update checker, Parakeet and Faster Whisper engines, Snap recipe.
+Shipped: graphical settings, multi-language support, whisper.cpp default, Vulkan GPU, Wayland/IBus, Flatpak packaging, AppImage, `.deb` / `.rpm` packages, in-app update checker, Parakeet and Faster Whisper engines, Snap recipe.
 
 Planned:
 
 - [ ] Application-specific voice commands
-- [ ] Debian/Ubuntu package (`.deb`)
 - [ ] User-customizable voice command map
 - [ ] Flathub publication (not currently listed; see #167)
 
@@ -381,3 +417,18 @@ corresponding source available.
 ## Star Chart
 
 [![Star History Chart](https://api.star-history.com/chart?repos=VocaHQ/vocalinux&type=date&legend=top-left&sealed_token=ZWyQQLhSORoR4mKf6UXMGFSCBXRxM_yEZgc8MFCH_ysBjaFUm_OCH-bI3TD7OivczEzm-ADRIpF9xCWFOMHvBPW95eQBxzfRMpNksChz7rN_eiqL7AIMDw)](https://www.star-history.com/?type=date&repos=VocaHQ%2Fvocalinux)
+
+### Optional Orukeet model
+
+With the Parakeet engine installed, Settings → Speech Model → Parakeet also
+offers `orukeet-v0.1.0`. It uses the existing local sherpa-onnx recognizer for
+25 European languages; the recommended Parakeet model and default whisper.cpp
+engine stay unchanged.
+
+The download comes from a pinned revision of
+[oruk/orukeet on Hugging Face](https://huggingface.co/oruk/orukeet). Vocalinux
+checks every file against its bundled SHA-256 pins and checks the publisher's
+release manifest against those same pins. The manifest download participates
+in Hugging Face's normal model-download accounting. Cached recognition works
+offline and does not send audio or usage events. The model occupies about
+641 MiB; its CC BY-SA 4.0 weights license and NVIDIA attribution are included.

@@ -6,9 +6,10 @@ How to install Vocalinux on Linux. Short overview: [project README](../README.md
 |------|-------------|
 | [Recommended installer](#recommended-installer) | Most users |
 | [AppImage](#appimage) | Portable binary; no system package install |
+| [Distro packages (.deb / .rpm)](#distro-packages-deb--rpm) | Debian 12+, Ubuntu 24.04+, Fedora |
 | [AUR](#arch-linux-aur) | Arch / Manjaro |
 | [Flatpak](#flatpak) | Release `.flatpak` or local build |
-| [Snap](#snap-ubuntu-snap-store) | Ubuntu Snap Store (`--edge`) |
+| [Snap](#snap-ubuntu-snap-store) | Ubuntu Snap Store (`--edge`) or GitHub `.snap` |
 | [From source](#from-source) | Contributors or custom trees |
 | [Manual / PyPI](INSTALL_MANUAL.md) | Full control or pip-only workflows |
 | [Troubleshooting](TROUBLESHOOTING.md) | Tray, audio, injection, models |
@@ -31,6 +32,16 @@ The installer:
 - Installs neural VAD when ONNX Runtime is available
 - Downloads the default whisper.cpp tiny model (~74MB), verified against pinned checksums
 - Sets up desktop integration and launch wrappers
+
+The source installer uses committed, hash-verified Python dependency exports,
+including its pip and source-build tools. GTK/PyGObject still comes from your
+distribution, and the venv retains access to system packages. A missing export
+or unavailable pinned package causes that installation step to fail; the
+existing optional-engine and VAD fallbacks still apply.
+
+Remote installs run the installer from the selected release tag. Older tags
+therefore retain their original dependency-install behavior; downloading a new
+bootstrap script does not change an older release's pins.
 
 ### Installer modes
 
@@ -77,9 +88,33 @@ chmod +x Vocalinux-*-x86_64.AppImage   # or aarch64
 ./Vocalinux-*-x86_64.AppImage
 ```
 
-Built against glibc 2.35, so it starts on Debian 12+, Ubuntu 22.04+, Fedora 36+, Arch, and Tumbleweed. Older bases (RHEL 9, Debian 11, Ubuntu 20.04) are below that floor; use the installer or PyPI there.
+Built against glibc 2.35, so it starts on Debian 12+, Ubuntu 22.04+, Fedora 36+, Arch, and Tumbleweed. Older bases (RHEL 9, Debian 11, Ubuntu 20.04) are below that AppImage floor. The installer and PyPI package still require a distro that ships Python 3.11+, so they are not a workaround for Debian 11 or Ubuntu 20.04.
 
 Still needs host text-injection tools (`xdotool` on X11; `wtype` / `ydotool` / clipboard tools on Wayland). Current AppImages rebuild whisper.cpp with Vulkan and use the host GPU driver (`vulkaninfo --summary`). Prefer the installer when you want system deps, a CUDA build, and models set up automatically.
+
+## Distro packages (.deb / .rpm)
+
+From [GitHub Releases](https://github.com/VocaHQ/vocalinux/releases), pick the file matching your distro and CPU:
+
+```bash
+# Debian / Ubuntu (amd64; arm64 files are attached too)
+sudo apt install ./vocalinux_*_amd64.deb
+
+# Fedora (x86_64; aarch64 files are attached too)
+sudo dnf install ./vocalinux-*.x86_64.rpm
+```
+
+These are thin packages: Python, GTK, PyGObject and the AppIndicator typelib come from the distribution, and `apt`/`dnf` resolves them. `xdotool`, `wtype`, `ydotool`, the clipboard tools and IBus are `Recommends`, matching the optional feature set of the other paths. Only `pywhispercpp` and `pynput` are vendored inside the package — `pywhispercpp` is packaged by neither distro and `pynput` is missing on Fedora. They land under `/usr/lib/vocalinux/vendor`, on `sys.path` via the `vocalinux` launcher.
+
+The `.deb` needs a distro that ships Python 3.11+: Debian 12+ and Ubuntu 24.04+ (Ubuntu 22.04 ships 3.10). whisper.cpp runs on CPU in these packages — the PyPI wheel, not the Vulkan build the AppImage carries. There is no auto-update: a new release is a new package install. A PPA and a COPR are not published yet.
+
+On Wayland, the default Right Alt shortcut reads keyboard devices through evdev, so your user needs `input` group membership or the hotkey is silently disabled:
+
+```bash
+sudo usermod -aG input $USER   # then log out and back in
+```
+
+Joining `input` grants read access to every keyboard and pointer device — X11 needs none of this. The launcher re-execs through `sg input` when `/etc/group` already lists the membership but the current session has not picked it up, so an `usermod` between package install and next login applies without a reboot. The source installer does this step for you; the packages cannot.
 
 ## Arch Linux (AUR)
 
@@ -91,13 +126,25 @@ See [AUR.md](AUR.md).
 
 ## Flatpak
 
-GitHub Releases attach `Vocalinux-<version>-x86_64.flatpak` and `Vocalinux-<version>-aarch64.flatpak`. After the Flathub GNOME runtime is present:
+Install and auto-update via the self-hosted VocaHQ remote (`flatpak update` picks up each release):
+
+```bash
+flatpak install https://vocahq.github.io/vocalinux-flatpak/com.vocalinux.Vocalinux.flatpakref
+```
+
+The `.flatpakref` adds the `vocahq` remote and resolves the GNOME runtime through Flathub. Manually instead:
+
+```bash
+flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+flatpak remote-add --if-not-exists vocahq https://vocahq.github.io/vocalinux-flatpak/vocahq.flatpakrepo
+flatpak install vocahq com.vocalinux.Vocalinux
+```
+
+Or sideload a GitHub Release bundle (`Vocalinux-<version>-x86_64.flatpak` or `-aarch64.flatpak`) after the Flathub GNOME runtime is present — bundles do not auto-update:
 
 ```bash
 flatpak install --user ./Vocalinux-<version>-x86_64.flatpak
 ```
-
-Bundles do not auto-update.
 
 Local build (contributors):
 
@@ -112,16 +159,31 @@ Whisper.cpp + Vulkan. It is **not on Flathub** (submission [flathub#9368](https:
 
 ## Snap (Ubuntu Snap Store)
 
-Listing: [snapcraft.io/vocalinux](https://snapcraft.io/vocalinux) (issue [#48](https://github.com/VocaHQ/vocalinux/issues/48)). Recipe: `snap/snapcraft.yaml`. Tagged `v*` releases publish to Snap Store `edge` and `candidate` when credentials are set. `stable` is still a manual promote after QA.
+Listing: [snapcraft.io/vocalinux](https://snapcraft.io/vocalinux) (issue [#48](https://github.com/VocaHQ/vocalinux/issues/48)). Recipe: `snap/snapcraft.yaml`. Tagged `v*` releases attach `vocalinux_<version>_amd64.snap` to the GitHub Release and try Snap Store `edge` and `candidate` when credentials are set. `stable` is promoted from `candidate` after QA.
+
+Store install, once Canonical lists the revision:
 
 ```bash
 sudo snap install vocalinux --edge
 sudo snap connect vocalinux:audio-record   # if mic is not auto-connected
 sudo snap connect vocalinux:raw-input      # global keyboard shortcuts (evdev)
+sudo snap connect vocalinux:hardware-observe  # list keyboards (/proc/bus/input/devices)
 sudo snap connect vocalinux:uinput         # native Wayland typing (ydotool)
 ```
 
-**v0.17.0** ships ydotool and the `uinput` plug. After `sudo snap install vocalinux --edge`, connect `uinput` and restart Vocalinux for native GNOME/GTK/Qt windows. **v0.16.2 edge (rev 7)** has no such plug and only types into XWayland apps; `sudo snap refresh vocalinux` first.
+**v0.18.1** ships ydotool and the `uinput` plug. That plug is super-privileged, so the Store held 0.18.0 for human review (`allow-installation`). Until a 0.18.0+ revision is listed, `snap info vocalinux` still shows **v0.16.2 (rev 7)** on edge. That revision has no `uinput` plug; `sudo snap connect vocalinux:uinput` fails.
+
+Sideload the GitHub `.snap` (amd64) while the Store is waiting:
+
+```bash
+sudo snap install --dangerous ./vocalinux_0.18.1_amd64.snap
+sudo snap connect vocalinux:audio-record
+sudo snap connect vocalinux:raw-input
+sudo snap connect vocalinux:hardware-observe
+sudo snap connect vocalinux:uinput
+```
+
+`--dangerous` is required because this file is not a Store revision. It will not refresh from the Store. After Canonical grants `uinput`, switch to `sudo snap install vocalinux --edge` (or `snap refresh`).
 
 ## From source
 
@@ -214,13 +276,24 @@ Switch engines in Settings → Speech Model (Advanced), or edit `~/.config/vocal
 
 ## Uninstall
 
+From a source checkout, `./uninstall.sh` removes the install and that checkout's `venv/`, `build/`, `dist/`, and Python bytecode. `--keep-config` and `--keep-data` leave `~/.config/vocalinux` and `~/.local/share/vocalinux` in place.
+
 ```bash
 ./uninstall.sh
 ./uninstall.sh --keep-config
 ./uninstall.sh --keep-data
 ```
 
-Manual cleanup:
+The website command downloads this same script and runs it:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/VocaHQ/vocalinux/main/uninstall.sh -o /tmp/vul.sh
+bash /tmp/vul.sh
+```
+
+That removes Vocalinux from your home directory (config, data, launchers, desktop entry, icons). It does not delete `venv/`, `build/`, `dist/`, or `.pyc` files in the directory where you ran it.
+
+From the source checkout, the equivalent by hand:
 
 ```bash
 rm -rf venv ~/.config/vocalinux ~/.local/share/vocalinux

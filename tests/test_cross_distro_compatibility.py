@@ -36,11 +36,12 @@ class TestCrossDistroCompatibility:
 
     @pytest.fixture
     def install_sh_content(self):
-        """Fixture to load install.sh content."""
+        """Fixture to load the installer entry point and sourced modules."""
         install_sh_path = REPO_ROOT / "install.sh"
         if not install_sh_path.exists():
             pytest.skip(f"install.sh not found at {install_sh_path}")
-        return install_sh_path.read_text()
+        parts = [install_sh_path, *sorted((REPO_ROOT / "install.d").glob("*.sh"))]
+        return "\n".join(path.read_text(encoding="utf-8") for path in parts)
 
     @pytest.fixture
     def workflow_content(self):
@@ -137,12 +138,12 @@ class TestCrossDistroCompatibility:
         assert "typelib-1_0-Notify-0_7" in install_sh_content
         assert "libnotify4" in install_sh_content
         assert "suse_install_appindicator_runtime" in install_sh_content
-        assert "shaderc glslang-devel glslang" in install_sh_content
-
         zypper_line = next(
-            line for line in install_sh_content.splitlines() if "local ZYPPER_PACKAGES=" in line
+            line
+            for line in install_sh_content.splitlines()
+            if "SYSTEM_PACKAGES=(gtk3 ibus " in line
         )
-        zypper_packages = zypper_line.split('"')[1].split()
+        zypper_packages = zypper_line.removeprefix("SYSTEM_PACKAGES=(").rstrip(")").split()
         # ibus, not the typelib alone: ibus_engine.py spawns `ibus-daemon -x -d -r`
         # and shells out to `ibus engine`, neither of which libibus provides.
         assert "ibus" in zypper_packages
@@ -156,10 +157,14 @@ class TestCrossDistroCompatibility:
     def test_rpm_arch_install_glslc_not_glslang(self, install_sh_content):
         """ggml Vulkan needs glslc (shaderc). glslangValidator is not a substitute (#604)."""
         dnf_line = next(
-            line for line in install_sh_content.splitlines() if "local DNF_PACKAGES=" in line
+            line
+            for line in install_sh_content.splitlines()
+            if "SYSTEM_PACKAGES=(python3-pip python3-gobject gtk3 " in line
         )
         pacman_line = next(
-            line for line in install_sh_content.splitlines() if "local PACMAN_PACKAGES=" in line
+            line
+            for line in install_sh_content.splitlines()
+            if "SYSTEM_PACKAGES=(python-pip python-gobject gtk3 " in line
         )
         assert "glslc" in dnf_line
         assert "patchelf" in dnf_line
@@ -176,7 +181,9 @@ class TestCrossDistroCompatibility:
             in install_sh_content
         )
         emerge_line = next(
-            line for line in install_sh_content.splitlines() if "local EMERGE_PACKAGES=" in line
+            line
+            for line in install_sh_content.splitlines()
+            if "SYSTEM_PACKAGES=(dev-python/pygobject:3 " in line
         )
         assert "media-libs/shaderc" in emerge_line
         assert "dev-util/patchelf" in emerge_line

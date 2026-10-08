@@ -67,6 +67,9 @@ def _dialog_stub() -> Mock:
     dialog.language = "en-us"
     dialog._last_non_parakeet_language = None
     dialog._engine_for_language_memory = None
+    # A Mock attribute is not a dict, which keeps the staged-spec lookups on the
+    # saved-model fallback; tests that exercise staging set this themselves.
+    dialog._staged_model_spec = None
     # The real attribute is an enum member; a bare "idle" string would compare
     # unequal and send every test down the stop_recognition + sleep(0.5) branch.
     dialog.speech_engine.state = RecognitionState.IDLE
@@ -213,7 +216,9 @@ def test_already_downloaded_auto_apply_runs_on_a_worker(settings_dialog, dialog_
     ):
         dialog_class._auto_apply_settings(dialog)
 
-    dialog._apply_settings_internal.assert_called_once_with(settings, raise_errors=True)
+    dialog._apply_settings_internal.assert_called_once_with(
+        settings, raise_errors=True, apply_generation=settings_dialog._apply_settings_generation
+    )
     dialog.speech_engine.reconfigure.assert_not_called()
     assert dialog._applying_settings is True
     _run_finish_idle(dialog, dialog_class, idle_calls)
@@ -304,7 +309,11 @@ def test_second_pick_during_apply_resyncs_ui_when_the_worker_finishes(
         assert len(workers) == 1
 
         workers[0].target()
-        dialog._apply_settings_internal.assert_called_once_with(first, raise_errors=True)
+        dialog._apply_settings_internal.assert_called_once_with(
+            first,
+            raise_errors=True,
+            apply_generation=settings_dialog._apply_settings_generation,
+        )
         assert dialog._applying_settings is True
 
         _run_finish_idle(dialog, dialog_class, idle_calls)
@@ -417,7 +426,7 @@ def test_download_path_resyncs_when_the_apply_reports_failure(settings_dialog, d
         patch.object(settings_dialog, "GLib", _glib_stub(idle_calls)),
         patch.object(settings_dialog.threading, "Thread", _InlineThread),
     ):
-        dialog_class._auto_apply_settings(dialog)
+        dialog_class._auto_apply_settings(dialog, allow_download=True)
 
     modal = modal_class.return_value
     scheduled = [(func, args) for func, args in idle_calls]
@@ -444,7 +453,7 @@ def test_download_path_resyncs_when_the_download_is_cancelled(settings_dialog, d
         patch.object(settings_dialog, "GLib", _glib_stub(idle_calls)),
         patch.object(settings_dialog.threading, "Thread", _InlineThread),
     ):
-        dialog_class._auto_apply_settings(dialog)
+        dialog_class._auto_apply_settings(dialog, allow_download=True)
 
     modal = modal_class.return_value
     assert (dialog._idle_resync_model_ui_from_config, ()) in idle_calls
@@ -467,7 +476,7 @@ def test_modal_close_resyncs_an_engine_that_never_applied(settings_dialog, dialo
         patch.object(settings_dialog, "GLib", MagicMock()),
         patch.object(settings_dialog.threading, "Thread", _InlineThread),
     ):
-        dialog_class._auto_apply_settings(dialog)
+        dialog_class._auto_apply_settings(dialog, allow_download=True)
 
     dialog._resync_engine_ui_if_unapplied.assert_called_once()
 
@@ -755,7 +764,10 @@ def test_settings_refuses_a_download_while_the_tray_holds_the_engine(
         patch.object(settings_dialog, "GLib", MagicMock()),
         patch.object(settings_dialog.threading, "Thread", _InlineThread),
     ):
-        getattr(dialog_class, entry)(dialog)
+        if entry == "_auto_apply_settings":
+            dialog_class._auto_apply_settings(dialog, allow_download=True)
+        else:
+            dialog_class.apply_settings(dialog)
 
     modal_class.assert_not_called()
     dialog._apply_settings_internal.assert_not_called()
@@ -775,10 +787,174 @@ def test_settings_releases_the_engine_once_the_download_is_over(
         patch.object(settings_dialog, "GLib", MagicMock()),
         patch.object(settings_dialog.threading, "Thread", _InlineThread),
     ):
-        getattr(dialog_class, entry)(dialog)
+        if entry == "_auto_apply_settings":
+            dialog_class._auto_apply_settings(dialog, allow_download=True)
+        else:
+            dialog_class.apply_settings(dialog)
 
     dialog.speech_engine.try_begin_download.assert_called_once_with()
     dialog.speech_engine.end_download.assert_called_once_with()
+
+
+def test_a_picker_change_only_stages_a_missing_model(
+    settings_dialog: Any, dialog_class: type[Any]
+) -> None:
+    """#894: a spec that is not on disk must not start downloading on its own.
+
+    Pickers stage the spec; nothing downloads and nothing is resynced away, so
+    the next pick keeps composing instead of fighting a modal. Edits outside
+    the spec are not part of it and still apply.
+    """
+    dialog = _dialog_stub()
+    _download_setup(dialog)
+    dialog.get_selected_settings.return_value["vad_sensitivity"] = 2
+
+    with (
+        patch.object(settings_dialog, "is_whispercpp_model_downloaded", return_value=False),
+        patch.object(settings_dialog, "ModelDownloadDialog") as modal_class,
+        patch.object(settings_dialog, "GLib", MagicMock()),
+        patch.object(settings_dialog.threading, "Thread", _InlineThread),
+    ):
+        dialog_class._auto_apply_settings(dialog)
+
+    modal_class.assert_not_called()
+    dialog.speech_engine.try_begin_download.assert_not_called()
+    # The spec keys are staged, not applied; edits outside it reach the
+    # engine live and save — never through reconfigure, which would cancel
+    # a buffered recording and reload the model on whispercpp_* keys.
+    dialog._apply_settings_internal.assert_not_called()
+    dialog.speech_engine.reconfigure.assert_not_called()
+    assert dialog.speech_engine.vad_sensitivity == 2
+    dialog._save_selected_settings.assert_called_once_with({"vad_sensitivity": 2})
+    assert dialog._staged_model_spec == {
+        "engine": "whisper_cpp",
+        "model_size": "small",
+        "model_variant": "",
+        "language": "en-us",
+    }
+    dialog._resync_model_ui_from_config.assert_not_called()
+    dialog._resync_engine_ui_if_unapplied.assert_not_called()
+    dialog._update_model_info.assert_called_once_with()
+
+
+def test_staging_several_specs_still_downloads_none(
+    settings_dialog: Any, dialog_class: type[Any]
+) -> None:
+    """Each field of the spec can flip without a single download starting."""
+    dialog = _dialog_stub()
+    _download_setup(dialog)
+
+    with (
+        patch.object(settings_dialog, "is_whispercpp_model_downloaded", return_value=False),
+        patch.object(settings_dialog, "ModelDownloadDialog") as modal_class,
+        patch.object(settings_dialog, "GLib", MagicMock()),
+        patch.object(settings_dialog.threading, "Thread", _InlineThread),
+    ):
+        for _flip in range(3):
+            dialog_class._auto_apply_settings(dialog)
+
+    modal_class.assert_not_called()
+    dialog.speech_engine.try_begin_download.assert_not_called()
+    dialog._apply_settings_internal.assert_not_called()
+
+
+def test_a_download_allowed_apply_still_downloads(
+    settings_dialog: Any, dialog_class: type[Any]
+) -> None:
+    """The simple questions keep the instant apply-and-download flow."""
+    dialog = _dialog_stub()
+    _download_setup(dialog)
+
+    with (
+        patch.object(settings_dialog, "is_whispercpp_model_downloaded", return_value=False),
+        patch.object(settings_dialog, "ModelDownloadDialog") as modal_class,
+        patch.object(settings_dialog, "GLib", MagicMock()),
+        patch.object(settings_dialog.threading, "Thread", _InlineThread),
+    ):
+        dialog_class._auto_apply_settings(dialog, allow_download=True)
+
+    dialog.speech_engine.try_begin_download.assert_called_once_with()
+    modal_class.assert_called_once()
+
+
+def test_the_download_button_confirms_the_staged_spec(dialog_class: type[Any]) -> None:
+    """The info card's Download action is the one explicit confirmation."""
+    dialog = _dialog_stub()
+
+    dialog_class._on_download_model_clicked(dialog, None)
+
+    dialog.apply_settings.assert_called_once_with()
+
+
+@pytest.mark.parametrize("entry", ["_auto_apply_settings", "apply_settings"])
+def test_a_finished_download_repaints_the_model_info_card(
+    settings_dialog: Any, dialog_class: type[Any], entry: str
+) -> None:
+    """A completed download must not leave the card on the pre-download render.
+
+    Without the repaint, the card keeps the amber size line and, since #894,
+    a Download action for the model that was just fetched. The cancel path
+    already repaints via ``_idle_resync_model_ui_from_config``; success needs
+    its own.
+    """
+    dialog = _dialog_stub()
+    _download_setup(dialog)
+
+    with (
+        patch.object(settings_dialog, "is_whispercpp_model_downloaded", return_value=False),
+        patch.object(settings_dialog, "ModelDownloadDialog"),
+        patch.object(settings_dialog, "GLib", MagicMock()),
+        patch.object(settings_dialog.threading, "Thread", _InlineThread),
+    ):
+        if entry == "_auto_apply_settings":
+            dialog_class._auto_apply_settings(dialog, allow_download=True)
+        else:
+            dialog_class.apply_settings(dialog)
+
+    dialog._update_model_info.assert_called_once()
+
+
+def _update_model_info_stub(dialog_class: type[Any]) -> Mock:
+    """Enough widget state for the real ``_update_model_info`` on whisper.cpp."""
+    dialog = _dialog_stub()
+    _bind_real(dialog, dialog_class, "_update_model_info")
+    dialog.engine_combo.get_active_text.return_value = "whisper.cpp"
+    dialog._get_selected_whispercpp_model.return_value = "small"
+    dialog._get_recommended_whispercpp_model_for_language.return_value = ("small", "fits")
+    dialog._downloaded_alternative_for.return_value = None
+    return dialog
+
+
+def test_the_info_card_offers_download_for_a_missing_model(
+    settings_dialog: Any, dialog_class: type[Any]
+) -> None:
+    """An undownloaded spec shows the confirm action on the info card."""
+    dialog = _update_model_info_stub(dialog_class)
+
+    with (
+        patch.object(settings_dialog, "is_whispercpp_model_downloaded", return_value=False),
+        patch.object(settings_dialog, "detect_compute_backend", return_value=("cpu", {})),
+        patch.object(settings_dialog, "get_backend_display_name", return_value="CPU"),
+    ):
+        dialog._update_model_info()
+
+    dialog.model_download_button.set_visible.assert_called_once_with(True)
+
+
+def test_the_info_card_offers_no_download_for_a_downloaded_model(
+    settings_dialog: Any, dialog_class: type[Any]
+) -> None:
+    """An already-downloaded spec never prompts (#894 acceptance)."""
+    dialog = _update_model_info_stub(dialog_class)
+
+    with (
+        patch.object(settings_dialog, "is_whispercpp_model_downloaded", return_value=True),
+        patch.object(settings_dialog, "detect_compute_backend", return_value=("cpu", {})),
+        patch.object(settings_dialog, "get_backend_display_name", return_value="CPU"),
+    ):
+        dialog._update_model_info()
+
+    dialog.model_download_button.set_visible.assert_called_once_with(False)
 
 
 def _dialog_for_engine_ui(engine_text: str):
@@ -786,6 +962,54 @@ def _dialog_for_engine_ui(engine_text: str):
     dialog = _dialog_stub()
     dialog.engine_combo.get_active_text.return_value = engine_text
     return dialog
+
+
+class _FakeCombo:
+    """ComboBoxText stand-in that records ids the way `_populate_model_options` writes them."""
+
+    def __init__(self) -> None:
+        self._items: list[tuple[str, str]] = []
+        self._active_id: str | None = None
+
+    def remove_all(self) -> None:
+        self._items.clear()
+        self._active_id = None
+
+    def append(self, item_id: str, text: str) -> None:
+        self._items.append((item_id, text))
+
+    def set_active_id(self, item_id: str) -> bool:
+        if any(stored_id == item_id for stored_id, _text in self._items):
+            self._active_id = item_id
+            return True
+        return False
+
+    def set_active(self, index: int) -> None:
+        self._active_id = self._items[index][0]
+
+    def get_active_id(self) -> str | None:
+        return self._active_id
+
+    def get_active_text(self) -> str | None:
+        for stored_id, text in self._items:
+            if stored_id == self._active_id:
+                return text
+        return None
+
+    def get_model(self) -> list[tuple[str, str]]:
+        # Gtk.ComboBoxText stores (display text, id); the populate fallback
+        # compares row[0] against the id it is trying to restore.
+        return [(text, stored_id) for stored_id, text in self._items]
+
+    @property
+    def ids(self) -> list[str]:
+        return [item_id for item_id, _text in self._items]
+
+    def text_for(self, item_id: str) -> str:
+        for stored_id, text in self._items:
+            if stored_id == item_id:
+                return text
+        raise KeyError(item_id)
 
 
 def _dialog_for_selected_settings(engine_text: str, language_id: str, model_id: str = "small"):
@@ -809,6 +1033,115 @@ def _dialog_for_selected_settings(engine_text: str, language_id: str, model_id: 
     dialog.advanced_no_speech_thold_spin.get_value.return_value = 0.6
     dialog.gpu_device_combo.get_active_id.return_value = None
     return dialog
+
+
+def _faster_whisper_picker_dialog(
+    dialog_class: type[Any], *, saved_model: str, language: str = "en-us"
+) -> Mock:
+    """Stub enough widgets to run real `_populate_model_options` for Faster Whisper."""
+    dialog = _dialog_for_selected_settings("Faster Whisper", language, model_id=saved_model)
+    dialog.language = language
+    dialog.config_manager.get_model_size_for_engine.return_value = saved_model
+    dialog.model_combo = _FakeCombo()
+    dialog.model_variant_combo = _FakeCombo()
+    _bind_real(dialog, dialog_class, "_populate_model_options", "get_selected_settings")
+    return dialog
+
+
+def _populate_faster_whisper_picker(
+    settings_dialog: Any,
+    dialog_class: type[Any],
+    *,
+    saved_model: str,
+    language: str = "en-us",
+    recommended: str = "small",
+) -> Mock:
+    dialog = _faster_whisper_picker_dialog(dialog_class, saved_model=saved_model, language=language)
+    with (
+        patch.object(
+            settings_dialog,
+            "get_recommended_faster_whisper_model",
+            return_value=(recommended, "CUDA GPU"),
+        ),
+        patch.object(settings_dialog, "is_faster_whisper_model_downloaded", return_value=False),
+    ):
+        dialog._populate_model_options()
+    return dialog
+
+
+def test_faster_whisper_picker_keeps_saved_english_model(settings_dialog, dialog_class):
+    """A tray-persisted ``small.en`` must stay selected instead of falling back."""
+    dialog = _populate_faster_whisper_picker(
+        settings_dialog, dialog_class, saved_model="small.en", language="en-us"
+    )
+
+    assert "small.en" in dialog.model_combo.ids
+    assert "Small.en" not in dialog.model_combo.ids
+    assert dialog.model_combo.get_active_id() == "small.en"
+    assert dialog.get_selected_settings()["model_size"] == "small.en"
+
+
+def test_faster_whisper_english_recommendation_stars_en_variant(settings_dialog, dialog_class):
+    """English language must star ``small.en``, not the bare multilingual row."""
+    dialog = _populate_faster_whisper_picker(
+        settings_dialog,
+        dialog_class,
+        saved_model="tiny",
+        language="en-us",
+        recommended="small",
+    )
+
+    assert " ★" in dialog.model_combo.text_for("small.en")
+    assert " ★" not in dialog.model_combo.text_for("small")
+
+
+def test_faster_whisper_non_english_stars_multilingual_and_keeps_saved_en(
+    settings_dialog, dialog_class
+):
+    """German must star ``small``, not ``small.en``, and must not rewrite a saved .en id."""
+    dialog = _populate_faster_whisper_picker(
+        settings_dialog,
+        dialog_class,
+        saved_model="small.en",
+        language="de",
+        recommended="small",
+    )
+
+    assert dialog.model_combo.get_active_id() == "small.en"
+    assert " ★" in dialog.model_combo.text_for("small")
+    assert " ★" not in dialog.model_combo.text_for("small.en")
+    assert dialog.get_selected_settings()["model_size"] == "small.en"
+
+
+def test_faster_whisper_selected_settings_keep_dotted_id(dialog_class):
+    """Raw combo ids such as ``small.en`` must persist through instant-apply."""
+    dialog = _dialog_for_selected_settings("Faster Whisper", "en-us", model_id="small.en")
+
+    settings = dialog_class.get_selected_settings(dialog)
+
+    assert settings["engine"] == "faster_whisper"
+    assert settings["model_size"] == "small.en"
+
+
+def test_whisper_picker_still_uses_capitalized_combo_ids(settings_dialog, dialog_class):
+    """Raw Faster Whisper ids must not leak into engines whose combo ids are capitalized."""
+    dialog = _dialog_for_selected_settings("Whisper", "en-us", model_id="small")
+    dialog.language = "en-us"
+    dialog.config_manager.get_model_size_for_engine.return_value = "small"
+    dialog.model_combo = _FakeCombo()
+    dialog.model_variant_combo = _FakeCombo()
+    _bind_real(dialog, dialog_class, "_populate_model_options")
+    with (
+        patch.object(
+            settings_dialog, "_get_recommended_whisper_model", return_value=("small", "reason")
+        ),
+        patch.object(settings_dialog, "_is_whisper_model_downloaded", return_value=False),
+    ):
+        dialog._populate_model_options()
+
+    assert "Small" in dialog.model_combo.ids
+    assert "small" not in dialog.model_combo.ids
+    assert dialog.model_combo.get_active_id() == "Small"
 
 
 def test_parakeet_hides_the_language_picker(dialog_class):
@@ -1081,9 +1414,7 @@ def test_parakeet_recognition_does_not_consume_language():
 
 def test_normalize_language_for_engine_forces_auto_for_parakeet():
     """CLI/saved non-auto languages must not survive for Parakeet."""
-    from vocalinux.speech_recognition.recognition_manager import (
-        normalize_language_for_engine,
-    )
+    from vocalinux.speech_recognition.recognition_manager import normalize_language_for_engine
 
     assert normalize_language_for_engine("parakeet", "fr") == "auto"
     assert normalize_language_for_engine("parakeet", "en-us") == "auto"
@@ -1204,3 +1535,116 @@ def test_speech_manager_command_processor_follows_language():
         manager.reconfigure(language="en-us", force_download=False)
     assert manager.command_processor.language == "en-us"
     assert "virgola" not in manager.command_processor.text_commands
+
+
+def test_deferred_text_edits_persist_once_the_inflight_apply_finishes(
+    settings_dialog: Any, dialog_class: type[Any]
+) -> None:
+    """Edits stashed at close are saved when no newer apply has begun."""
+    dialog = _dialog_stub()
+    dialog._pending_text_edits = {"whispercpp_language_candidates": "en,es"}
+    dialog._pending_apply_generation = settings_dialog._apply_settings_generation
+
+    with patch.object(settings_dialog.threading, "Thread", _InlineThread):
+        dialog_class._persist_pending_text_edits(dialog)
+
+    dialog.speech_engine.reconfigure.assert_called_once_with(whispercpp_language_candidates="en,es")
+    dialog.config_manager.set.assert_called_once_with(
+        "advanced", "whispercpp_language_candidates", "en,es"
+    )
+    dialog.config_manager.save_settings.assert_called_once()
+
+
+def test_deferred_text_edits_dropped_when_a_newer_apply_ran(
+    settings_dialog: Any, dialog_class: type[Any]
+) -> None:
+    """A newer apply owns the engine and config; the stashed snapshot stays stale."""
+    dialog = _dialog_stub()
+    dialog._pending_text_edits = {"whispercpp_language_candidates": "en,es"}
+    dialog._pending_text_edit_baseline = {"whispercpp_language_candidates": "en"}
+    dialog._pending_apply_generation = settings_dialog._apply_settings_generation
+    # A newer apply began after the edits were stashed and rewrote the key.
+    settings_dialog._apply_settings_generation += 1
+    settings_dialog._apply_settings_written["whispercpp_language_candidates"] = (
+        settings_dialog._apply_settings_generation
+    )
+    dialog.config_manager.get.side_effect = lambda section, key, default=None: "en"
+
+    try:
+        with patch.object(settings_dialog.threading, "Thread", _InlineThread):
+            dialog_class._persist_pending_text_edits(dialog)
+    finally:
+        settings_dialog._apply_settings_written.pop("whispercpp_language_candidates", None)
+
+    dialog.speech_engine.reconfigure.assert_not_called()
+    dialog.config_manager.set.assert_not_called()
+    dialog.config_manager.save_settings.assert_not_called()
+
+
+def test_deferred_text_edits_dropped_when_newer_apply_wrote_baseline_value(
+    settings_dialog: Any, dialog_class: type[Any]
+) -> None:
+    """A newer choice equal to the baseline is still a choice the edit must lose to."""
+    dialog = _dialog_stub()
+    dialog._pending_text_edits = {"whispercpp_language_candidates": "en,es"}
+    dialog._pending_text_edit_baseline = {"whispercpp_language_candidates": "en"}
+    dialog._pending_apply_generation = settings_dialog._apply_settings_generation
+    # The reopened dialog applied the key back to its baseline value. The
+    # config is indistinguishable from untouched, yet the write counts as
+    # touched — the closed dialog's older edit must not overwrite it.
+    settings_dialog._apply_settings_generation += 1
+    settings_dialog._apply_settings_written["whispercpp_language_candidates"] = (
+        settings_dialog._apply_settings_generation
+    )
+    dialog.config_manager.get.side_effect = lambda section, key, default=None: "en"
+
+    try:
+        with patch.object(settings_dialog.threading, "Thread", _InlineThread):
+            dialog_class._persist_pending_text_edits(dialog)
+    finally:
+        settings_dialog._apply_settings_written.pop("whispercpp_language_candidates", None)
+
+    dialog.speech_engine.reconfigure.assert_not_called()
+    dialog.config_manager.set.assert_not_called()
+    dialog.config_manager.save_settings.assert_not_called()
+
+
+def test_superseded_apply_skips_the_stale_snapshot(
+    settings_dialog: Any, dialog_class: type[Any]
+) -> None:
+    """A worker whose snapshot a newer apply predates must not write at all."""
+    dialog = _dialog_stub()
+    dialog.speech_engine.state = RecognitionState.LISTENING
+    stale_generation = settings_dialog._apply_settings_generation
+    # A newer apply began after this snapshot was collected.
+    settings_dialog._apply_settings_generation += 1
+
+    result = dialog_class._apply_settings_internal(
+        dialog,
+        {"whispercpp_language_candidates": "en,es"},
+        apply_generation=stale_generation,
+    )
+
+    assert result is True
+    # Dictation must keep running: the staleness check precedes the stop.
+    dialog.speech_engine.stop_recognition.assert_not_called()
+    dialog.speech_engine.reconfigure.assert_not_called()
+    dialog.config_manager.set.assert_not_called()
+    dialog.config_manager.save_settings.assert_not_called()
+
+
+def test_deferred_text_edits_skipped_when_the_inflight_apply_landed_them(
+    settings_dialog: Any, dialog_class: type[Any]
+) -> None:
+    """No second model restart when the saved values already match the edits."""
+    dialog = _dialog_stub()
+    dialog._pending_text_edits = {"whispercpp_language_candidates": "en,es"}
+    dialog._pending_apply_generation = settings_dialog._apply_settings_generation
+    dialog.config_manager.get.side_effect = lambda section, key, default=None: "en,es"
+
+    with patch.object(settings_dialog.threading, "Thread", _InlineThread):
+        dialog_class._persist_pending_text_edits(dialog)
+
+    dialog.speech_engine.reconfigure.assert_not_called()
+    dialog.config_manager.set.assert_not_called()
+    dialog.config_manager.save_settings.assert_not_called()

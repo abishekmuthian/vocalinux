@@ -29,12 +29,17 @@
 # Set VOCALINUX_APPIMAGE_REQUIRE_VULKAN=1 in CI so a failed rebuild fails
 # the job instead of shipping a CPU-only image. Set
 # VOCALINUX_APPIMAGE_SKIP_VULKAN=1 to force the CPU wheel.
+# A build that produced libggml-vulkan.so is kept in VOCALINUX_APPIMAGE_CACHE
+# and reused while the base image, tool_checksums.txt, and the pywhispercpp
+# pin are unchanged. A CPU-only build is not cached.
 set -euo pipefail
 
 WHEEL="$1"
 VERSION="$2"
 OUTDIR="${3:-dist}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# shellcheck source=native-cache.sh
+source "$(dirname "${BASH_SOURCE[0]}")/native-cache.sh"
 
 # Same pywhispercpp release install.sh pins. Read from there rather than repeated
 # here: unpinned, this build picks up whatever PyPI published today, which is how
@@ -117,13 +122,20 @@ TYPELIBS=(
   GModule-2.0 Pango-1.0 PangoCairo-1.0 cairo-1.0 HarfBuzz-0.0 Atk-1.0
   freetype2-2.0 fontconfig-2.0 xlib-2.0
   AyatanaAppIndicator3-0.1 AyatanaAppindicator3-0.1 AppIndicator3-0.1
-  Dbusmenu-0.4 Notify-0.7 IBus-1.0 Rsvg-2.0
+  Dbusmenu-0.4 Notify-0.7 IBus-1.0 Rsvg-2.0 GtkLayerShell-0.1
 )
 
 # Runtime only needs one tray stack (same order as tray_indicator.py). Prefer
 # Ayatana; accept the rare lowercase typelib; legacy AppIndicator3 last.
 INDICATOR_TYPELIBS=(
   AyatanaAppIndicator3-0.1 AyatanaAppindicator3-0.1 AppIndicator3-0.1
+)
+
+# Soft dependencies the app itself falls back from: dictation_overlay.py uses a
+# plain GTK window when layer shell is absent, so these are copied when found
+# but must never block a direct build on a host without them.
+OPTIONAL_TYPELIBS=(
+  GtkLayerShell-0.1
 )
 
 # Shared libs loaded via GI at runtime (not linked into python3), so
@@ -136,6 +148,7 @@ GI_RUNTIME_LIBS=(
   libdbusmenu-gtk3.so.4
   libnotify.so.4
   libibus-1.0.so.5
+  libgtk-layer-shell.so.0
   # Nothing imports PangoXft, but linuxdeploy keeps its typelib, and a typelib
   # without its library is the trap that cost us IBus. 30 KB is cheaper than an
   # exception to the rule.
@@ -147,6 +160,10 @@ GI_RUNTIME_LIBS=(
 HOST_PROVIDED_LIBS=(
   libharfbuzz.so.0
   libharfbuzz-gobject.so.0
+  # Layer shell is optional end to end (see OPTIONAL_TYPELIBS): when its
+  # library cannot be bundled, the host's copy is the right one — the app
+  # falls back to a plain GTK window when no host copy exists either.
+  libgtk-layer-shell.so.0
 )
 
 # On the excludelist, but something we bundle links them, so the host cannot be
@@ -264,7 +281,7 @@ copy_typelibs() {
   done
 
   # Tray indicator typelibs are alternates; drop them from the hard-fail list
-  # when at least one copied successfully.
+  # when at least one copied successfully. Optional typelibs never hard-fail.
   local hard_missing=()
   for typelib in "${missing[@]}"; do
     case " ${INDICATOR_TYPELIBS[*]} " in
@@ -274,7 +291,10 @@ copy_typelibs() {
         fi
         ;;
       *)
-        hard_missing+=("$typelib")
+        case " ${OPTIONAL_TYPELIBS[*]} " in
+          *" ${typelib} "*) ;;
+          *) hard_missing+=("$typelib") ;;
+        esac
         ;;
     esac
   done
@@ -407,13 +427,10 @@ copy_whisper_native_libs_to_usr_lib() {
   done < <(find "$APPDIR/usr" \( -name 'libggml*.so*' -o -name 'libwhisper.so*' \) ! -path '*/usr/lib/*' 2>/dev/null || true)
 }
 
-rebuild_pywhispercpp_vulkan() {
-  local require_vulkan="${VOCALINUX_APPIMAGE_REQUIRE_VULKAN:-0}"
-  if [ "${VOCALINUX_APPIMAGE_SKIP_VULKAN:-0}" = "1" ]; then
-    echo "== Skipping pywhispercpp Vulkan rebuild (VOCALINUX_APPIMAGE_SKIP_VULKAN=1) =="
-    return 0
-  fi
-
+# The miss path of rebuild_pywhispercpp_vulkan. require_vulkan, cache_dir, and
+# site are locals of that caller; bash shows them to this function.
+_compile_pywhispercpp_vulkan() {
+  local vk_lib
   if ! has_vulkan_build_deps; then
     echo "Vulkan build deps missing (libvulkan-dev plus a C++ compiler)." >&2
     if [ "$require_vulkan" = "1" ]; then
@@ -466,7 +483,6 @@ rebuild_pywhispercpp_vulkan() {
     return 0
   fi
 
-  local vk_lib
   vk_lib="$(find "$APPDIR/usr" -name 'libggml-vulkan.so*' 2>/dev/null | head -1 || true)"
   if [ -z "$vk_lib" ]; then
     echo "Vulkan rebuild did not produce libggml-vulkan.so." >&2
@@ -479,6 +495,26 @@ rebuild_pywhispercpp_vulkan() {
   fi
   echo "  found $vk_lib"
   copy_whisper_native_libs_to_usr_lib
+  if ! pywhispercpp_cache_publish "$site" "$cache_dir"; then
+    echo "Warning: Vulkan build succeeded but was not cached for the next run." >&2
+  fi
+}
+
+rebuild_pywhispercpp_vulkan() {
+  local require_vulkan="${VOCALINUX_APPIMAGE_REQUIRE_VULKAN:-0}"
+  if [ "${VOCALINUX_APPIMAGE_SKIP_VULKAN:-0}" = "1" ]; then
+    echo "== Skipping pywhispercpp Vulkan rebuild (VOCALINUX_APPIMAGE_SKIP_VULKAN=1) =="
+    return 0
+  fi
+
+  # The Vocalinux wheel was installed above and is not part of this cache.
+  # A hit still replaces the CPU pywhispercpp wheel the lock just installed,
+  # and it does not run _compile_pywhispercpp_vulkan.
+  local cache_dir site
+  cache_dir="$(pywhispercpp_native_cache_dir "$ARCH")"
+  site="$APPDIR/usr/lib/python${PY_VER}/site-packages"
+  pywhispercpp_restore_or_run "$cache_dir" "$site" copy_whisper_native_libs_to_usr_lib \
+    _compile_pywhispercpp_vulkan
 }
 
 echo "== Copying GObject-Introspection typelibs (not handled by linuxdeploy-plugin-gtk) =="

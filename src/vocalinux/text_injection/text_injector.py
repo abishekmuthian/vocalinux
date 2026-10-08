@@ -14,7 +14,7 @@ import subprocess
 import threading
 import time
 from enum import Enum
-from typing import Optional
+from typing import List, Optional, Tuple
 
 from ..utils.host_process import host_env
 from ..utils.paths import config_dir
@@ -25,6 +25,13 @@ from .ibus_engine import (
     is_ibus_available,
     is_ibus_daemon_running,
 )
+from .remote_desktop_portal import (
+    KEYSYM_BACKSPACE,
+    RemoteDesktopPortal,
+    RemoteDesktopPortalError,
+)
+
+_PORTAL_SUBMIT_TIMEOUT_S = 195.0  # portal's _START_TIMEOUT_S + _REQUEST_TIMEOUT_S
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +97,22 @@ class DesktopEnvironment(Enum):
     UNKNOWN = "unknown"
 
 
+class _InjectionAborted(Exception):
+    """Raised inside injection helpers when shutdown cuts an injection short."""
+
+
+class _PartiallyTyped(subprocess.CalledProcessError):
+    """A chunked type call delivered a prefix of the text before failing.
+
+    ``typed`` counts the characters already on screen so a fallback can
+    continue from the remainder instead of typing them a second time.
+    """
+
+    def __init__(self, typed: int, cause: subprocess.CalledProcessError) -> None:
+        super().__init__(cause.returncode, cause.cmd, output=cause.output, stderr=cause.stderr)
+        self.typed = typed
+
+
 class TextInjector:
     """
     Class for injecting text into the active application.
@@ -97,6 +120,16 @@ class TextInjector:
     This class handles the injection of text into the currently focused
     application window, supporting both X11 and Wayland environments.
     """
+
+    # Class-level fallback so objects built without __init__ (test helpers
+    # using __new__) still answer the abort checks; __init__ rebinds a fresh
+    # per-instance event, so the shared default is never the one that is set.
+    _abort_injections: threading.Event = threading.Event()
+
+    # Characters confirmed delivered by the most recent inject_text call:
+    # the full length on success, the confirmed prefix after a partial
+    # failure, -1 when delivery is unknowable, 0 when nothing was typed.
+    last_typed_count: int = 0
 
     def __init__(self, wayland_mode: bool = False):
         """
@@ -106,12 +139,16 @@ class TextInjector:
             wayland_mode: Force Wayland compatibility mode
         """
         self._ibus_injector: Optional[IBusTextInjector] = None
+        self._portal: Optional[RemoteDesktopPortal] = None
+        self._backend_pin: Tuple[str, Optional[str]] = ("auto", None)
         self.environment = self._detect_environment()
         self._session_environment = self.environment
         self._ibus_ready = False
         self._ibus_init_failed = False
         self._ibus_init_thread: Optional[threading.Thread] = None
         self._state_lock = threading.Lock()
+        self._abort_injections = threading.Event()
+        self.last_typed_count = 0
         self._clipboard_tool_health = {}
         self._clipboard_timeout = 0.35
         # Overlapping ydotool pastes: bump generation to cancel stale restores;
@@ -177,6 +214,11 @@ class TextInjector:
             except Exception as e:
                 logger.error(f"XWayland fallback test failed: {e}")
 
+        # Last, so it sees the final selection: _check_dependencies() returns early
+        # on two paths, and the wtype probe above can still demote a pin that was
+        # honoured up to that point.
+        self._warn_if_pin_not_honoured(*self._backend_pin)
+
     def stop(self) -> None:
         """
         Clean up resources and restore previous state.
@@ -188,6 +230,11 @@ class TextInjector:
                 logger.info("Stopping IBus text injector")
                 self._ibus_injector.stop()
                 self._ibus_injector = None
+            portal = getattr(self, "_portal", None)
+            if portal is not None:
+                logger.info("Closing RemoteDesktop portal session")
+                portal.close()
+                self._portal = None
             self._ibus_ready = False
 
     def _probe_wtype_support(self) -> subprocess.CompletedProcess:
@@ -249,56 +296,80 @@ class TextInjector:
         "weston",
     )
 
+    # Backends a user may pin explicitly, via VOCALINUX_FORCE_BACKEND or the
+    # text_injection.backend setting. Named once so the two readers and the two
+    # "expected ..." messages cannot drift apart as values are added.
+    _SELECTABLE_BACKENDS = ("ibus", "portal", "wtype", "ydotool", "xdotool")
+
+    # The chosen Wayland injection tool; None until _check_dependencies picks
+    # one (readers go through getattr because __new__ tests skip __init__).
+    wayland_tool: Optional[str]
+
+    @staticmethod
+    def _accepted_backends_help() -> str:
+        """The accepted pin values, for user-facing "expected ..." messages."""
+        return "/".join(TextInjector._SELECTABLE_BACKENDS) + "/auto"
+
     def _kde_virtual_keyboard_enabled(self) -> bool:
         """Return True when KWin VirtualKeyboard / input method is enabled.
 
         On KDE Plasma Wayland, IBus only reaches native apps when this is on
-        (issue #574). Disabled or unqueryable → treat IBus as unbridged.
+        (issue #574). KWin 6 reports the setting through the ``available``
+        property; ``enabled`` existed on Plasma 5 and is kept as a fallback
+        (issue #911). Disabled or unqueryable → treat IBus as unbridged.
         """
-        try:
-            result = subprocess.run(
-                [
-                    "gdbus",
-                    "call",
-                    "--session",
-                    "--dest",
-                    "org.kde.KWin",
-                    "--object-path",
-                    "/VirtualKeyboard",
-                    "--method",
-                    "org.freedesktop.DBus.Properties.Get",
-                    "org.kde.kwin.VirtualKeyboard",
-                    "enabled",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=2,
-                env=host_env(),
-            )
-        except (subprocess.SubprocessError, FileNotFoundError) as e:
-            logger.info(
-                "Could not query KWin VirtualKeyboard (%s); treating IBus as unbridged.",
-                e,
-            )
-            return False
+        for prop in ("available", "enabled"):
+            try:
+                result = subprocess.run(
+                    [
+                        "gdbus",
+                        "call",
+                        "--session",
+                        "--dest",
+                        "org.kde.KWin",
+                        "--object-path",
+                        "/VirtualKeyboard",
+                        "--method",
+                        "org.freedesktop.DBus.Properties.Get",
+                        "org.kde.kwin.VirtualKeyboard",
+                        prop,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                    env=host_env(),
+                )
+            except (subprocess.SubprocessError, FileNotFoundError) as e:
+                logger.info(
+                    "Could not query KWin VirtualKeyboard (%s); treating IBus as unbridged.",
+                    e,
+                )
+                return False
 
-        out = (result.stdout or "").strip().lower() if result.returncode == 0 else ""
-        # gdbus prints variant wrappers like: (<<true>>,) or (<<false>>,)
-        if "<<true>>" in out:
-            return True
-        if "<<false>>" in out:
-            logger.info(
-                "KWin Virtual Keyboard is disabled; IBus commits will not reach "
-                "native apps. Falling back to ydotool/wtype. Enable: System "
-                "Settings → Keyboard → Virtual Keyboard → IBus Wayland."
+            out = (result.stdout or "").strip().lower() if result.returncode == 0 else ""
+            # gdbus prints the variant as (<true>,) on KWin 6 and doubly
+            # wrapped as (<<true>>,) on Plasma 5; the bare "<true>" substring
+            # matches both forms.
+            if "<true>" in out:
+                return True
+            if "<false>" in out:
+                logger.info(
+                    "KWin Virtual Keyboard is disabled; IBus commits will not reach "
+                    "native apps. Falling back to ydotool/wtype. Enable: System "
+                    "Settings → Keyboard → Virtual Keyboard → IBus Wayland."
+                )
+                return False
+            # The property does not exist on this KWin (Plasma 6 dropped
+            # 'enabled'; Plasma 5 lacks 'available') or its answer was not a
+            # readable boolean -- try the other name before giving up.
+            logger.debug(
+                "KWin VirtualKeyboard property '%s' inconclusive (rc=%s out=%r).",
+                prop,
+                result.returncode,
+                result.stdout,
             )
-            return False
 
-        logger.info(
-            "KWin VirtualKeyboard not confirmed (rc=%s out=%r); treating IBus as unbridged.",
-            result.returncode,
-            result.stdout,
-        )
+        logger.info("KWin VirtualKeyboard not confirmed; treating IBus as unbridged.")
         return False
 
     @staticmethod
@@ -476,6 +547,39 @@ class TextInjector:
         return False
 
     @staticmethod
+    def _forced_backend_setting() -> Optional[str]:
+        """``VOCALINUX_FORCE_BACKEND`` as three distinct states.
+
+        ``None`` when the variable is not set, ``"auto"`` when it is explicitly
+        set to auto, otherwise the backend name. The distinction matters:
+        ``auto`` is how a user asks for autodetection *this run* despite a saved
+        ``text_injection.backend`` pin, which is the one-run A/B test this
+        variable exists for. Collapsing it into "nothing was set" would let the
+        saved pin win and make the variable useless for that.
+
+        Accepts ``ibus``, ``portal``, ``wtype``, ``ydotool``, ``xdotool`` or
+        ``auto``.
+        """
+        raw = os.environ.get("VOCALINUX_FORCE_BACKEND")
+        if raw is None:
+            return None
+        value = raw.strip().lower()
+        if not value:
+            return None
+        if value == "auto":
+            return "auto"
+        if value in TextInjector._SELECTABLE_BACKENDS:
+            return value
+        logger.warning(
+            "Ignoring unknown VOCALINUX_FORCE_BACKEND=%r (expected %s)",
+            value,
+            TextInjector._accepted_backends_help(),
+        )
+        # Deliberately unset rather than "auto": a typo in a shell variable should
+        # not discard a valid saved pin, only fail to override it.
+        return None
+
+    @staticmethod
     def _uinput_usable() -> bool:
         """Return True when this process can open ``/dev/uinput`` for write."""
         try:
@@ -519,19 +623,16 @@ class TextInjector:
         when the inference is wrong, and makes the two paths A/B-testable
         without editing code.
 
-        Accepts ``ibus``, ``wtype``, ``ydotool`` or ``auto``. Anything else is
-        ignored with a warning, so a typo cannot silently pin a backend.
+        Accepts ``ibus``, ``portal``, ``wtype``, ``ydotool``, ``xdotool`` or
+        ``auto``. Anything else is ignored with a warning, so a typo cannot
+        silently pin a backend.
+
+        This covers the environment variable only. ``_backend_preference()``
+        combines it with the persistent ``text_injection.backend`` setting, and
+        needs unset and an explicit ``auto`` told apart -- see
+        ``_forced_backend_setting()``.
         """
-        value = os.environ.get("VOCALINUX_FORCE_BACKEND", "").strip().lower()
-        if not value or value == "auto":
-            return "auto"
-        if value in ("ibus", "wtype", "ydotool"):
-            return value
-        logger.warning(
-            "Ignoring unknown VOCALINUX_FORCE_BACKEND=%r (expected ibus/wtype/ydotool/auto)",
-            value,
-        )
-        return "auto"
+        return TextInjector._forced_backend_setting() or "auto"
 
     def _resolve_wayland_key_tool(self) -> Optional[str]:
         """Pick (or reuse) the Wayland virtual-keyboard tool for key events.
@@ -566,12 +667,209 @@ class TextInjector:
         logger.info(f"Using {tool} for Wayland key events")
         return tool
 
+    @staticmethod
+    def _configured_backend() -> str:
+        """Backend pinned via ``text_injection.backend`` in config.json, or ``"auto"``.
+
+        The environment variable is fine for a one-off experiment, but a user
+        whose compositor is autodetected wrongly needs the choice to survive a
+        restart without wrapping the launcher in a shell script (issue #476).
+
+        Read from disk rather than through ConfigManager to keep this package
+        independent of the UI layer, matching ``_should_copy_to_clipboard()``.
+
+        A file that cannot be used is reported at warning level, not debug. This
+        setting is hand-edited, so a stray comma is a likely way to reach it, and
+        the symptom of staying quiet is the silent IBus miss the pin was set to
+        avoid -- indistinguishable from the pin simply not working.
+
+        The two shape checks below are what keep the lookup total, so the
+        handler only has to cover reading and parsing. Locating the file is
+        deliberately outside the handler: ``config_dir()`` resolving a path is
+        not a failure this should paper over, and computing it inside the
+        ``try`` only meant the handler could not name the file it failed on.
+        """
+        import json
+
+        config_path = os.path.join(config_dir(), "config.json")
+        if not os.path.exists(config_path):
+            return "auto"
+
+        try:
+            with open(config_path, "r") as f:
+                config = json.load(f)
+        except (OSError, ValueError) as e:
+            # Corrupt or unreadable must not block startup, but must not pass
+            # unmentioned either: the user edited this file expecting an effect.
+            logger.warning(
+                "Ignoring text_injection.backend: could not read %s (%s). "
+                "Continuing with backend autodetection.",
+                config_path,
+                e,
+            )
+            return "auto"
+
+        if not isinstance(config, dict):
+            logger.warning(
+                "Ignoring text_injection.backend: %s is not a JSON object. "
+                "Continuing with backend autodetection.",
+                config_path,
+            )
+            return "auto"
+
+        section = config.get("text_injection")
+        if section is None:
+            return "auto"
+        if not isinstance(section, dict):
+            logger.warning(
+                "Ignoring text_injection.backend: the text_injection section of %s "
+                "is not a JSON object. Continuing with backend autodetection.",
+                config_path,
+            )
+            return "auto"
+
+        value = str(section.get("backend", "") or "").strip().lower()
+        if not value or value == "auto":
+            return "auto"
+        if value in TextInjector._SELECTABLE_BACKENDS:
+            return value
+        logger.warning(
+            "Ignoring unknown text_injection.backend=%r (expected %s)",
+            value,
+            TextInjector._accepted_backends_help(),
+        )
+        return "auto"
+
+    @staticmethod
+    def _resolve_backend_pin() -> Tuple[str, Optional[str]]:
+        """The pinned backend and where it came from, resolved once.
+
+        Returns ``(backend, source)``. ``source`` names the setting that won, or
+        is ``None`` when nothing pinned anything. Both come from a single pass so
+        callers that report the source cannot disagree with the value actually
+        used -- and so the environment is parsed once per construction, which
+        also means a malformed value is reported once rather than per caller.
+
+        ``VOCALINUX_FORCE_BACKEND`` wins so a backend can still be A/B-tested
+        for one run without editing (or permanently changing) the user's config.
+        That includes an explicit ``auto``, which asks for autodetection this run
+        and so must short-circuit here rather than fall through to the saved pin.
+        """
+        env = TextInjector._forced_backend_setting()
+        if env is not None:
+            return env, "VOCALINUX_FORCE_BACKEND"
+        configured = TextInjector._configured_backend()
+        if configured != "auto":
+            return configured, "text_injection.backend"
+        return "auto", None
+
+    @staticmethod
+    def _backend_preference() -> str:
+        """The backend to pin, from the environment or config.json."""
+        return TextInjector._resolve_backend_pin()[0]
+
+    @staticmethod
+    def _resolved_backend_from_state(
+        ibus_injector: Optional[IBusTextInjector],
+        environment: DesktopEnvironment,
+        wayland_tool: Optional[str],
+    ) -> Optional[str]:
+        """Resolve a backend from one consistent snapshot of injector state."""
+        if ibus_injector is not None and environment in (
+            DesktopEnvironment.X11_IBUS,
+            DesktopEnvironment.WAYLAND_IBUS,
+        ):
+            return "ibus"
+        if environment in (
+            DesktopEnvironment.X11,
+            DesktopEnvironment.WAYLAND_XDOTOOL,
+        ):
+            return "xdotool"
+        return wayland_tool
+
+    def _resolved_backend(self) -> Optional[str]:
+        """The backend actually in effect, read back from final state.
+
+        Deliberately reads ``environment`` before ``wayland_tool``: the wtype
+        probe in ``__init__`` demotes a failed wtype to ``WAYLAND_XDOTOOL``
+        without clearing ``wayland_tool``, and ``inject_text()`` follows
+        ``environment``. Reading the tool first would report wtype while
+        injection actually goes through XWayland.
+        """
+        with self._state_lock:
+            ibus_injector = self._ibus_injector
+            environment = self.environment
+            wayland_tool = getattr(self, "wayland_tool", None)
+        return self._resolved_backend_from_state(ibus_injector, environment, wayland_tool)
+
+    def _warn_if_pin_not_honoured(self, pinned: str, source: Optional[str]) -> None:
+        """Say so when the backend in use is not the one that was pinned.
+
+        One comparison rather than a check per cause: a missing binary, a value
+        that does not apply to this session type, IBus being unavailable and the
+        wtype probe demoting to XWayland all end the same way -- something other
+        than the pinned backend is doing the typing -- and a new cause is covered
+        without adding a branch here.
+
+        This is a startup diagnostic, not a live invariant. It runs once, at the
+        end of construction. ``_try_recover_from_fallback()`` can later switch
+        the tool when ydotoold appears mid-session, so a pin that becomes
+        honoured (or stops being honoured) after startup is not reported again.
+        """
+        if not source or pinned == "auto":
+            return
+        with self._state_lock:
+            ibus_injector = self._ibus_injector
+            environment = self.environment
+            ibus_ready = self._ibus_ready
+            ibus_init_failed = self._ibus_init_failed
+            wayland_tool = getattr(self, "wayland_tool", None)
+        resolved = self._resolved_backend_from_state(ibus_injector, environment, wayland_tool)
+
+        if (
+            pinned == "ibus"
+            and ibus_injector is not None
+            and not ibus_ready
+            and not ibus_init_failed
+            and resolved != "ibus"
+        ):
+            logger.info(
+                "%s=%s: IBus initialization is pending; backend selection is not final.",
+                source,
+                pinned,
+            )
+            return
+        # Unreachable today (every path either sets a backend or raises before
+        # construction finishes), but guarded so a future path cannot render
+        # "using None instead" at a user.
+        if resolved is None or resolved == pinned:
+            return
+
+        if pinned == "ibus":
+            reason = " (IBus support is not available)" if not is_ibus_available() else ""
+        elif pinned == "portal":
+            # The portal is not a binary; probe it rather than PATH.
+            reason = "" if self._portal_probe() else " (RemoteDesktop portal is not available)"
+        elif pinned in self._SELECTABLE_BACKENDS:
+            reason = f" ({pinned} is not installed)" if not shutil.which(pinned) else ""
+        else:
+            reason = ""
+        logger.warning(
+            "%s=%s was not applied%s; using %s instead.", source, pinned, reason, resolved
+        )
+
     def _check_dependencies(self):
         """Check for the required tools for text injection."""
         ibus_requested = False
-        forced = self._forced_backend()
-        if forced != "auto":
-            logger.info("VOCALINUX_FORCE_BACKEND=%s: overriding backend autodetection", forced)
+        forced, pin_source = self._resolve_backend_pin()
+        self._backend_pin = (forced, pin_source)
+        if pin_source and forced != "auto":
+            # States the request, not the result. Nothing has been checked for
+            # availability yet, and an unavailable pin falls through to
+            # autodetection further down -- so a word like "overriding" here
+            # would describe an outcome this line cannot know, and would read as
+            # contradicting the "was not applied" warning when it does not hold.
+            logger.info("%s=%s: backend pin requested", pin_source, forced)
 
         # Prefer IBus on both X11 and Wayland - it sends Unicode directly,
         # bypassing keyboard layout issues entirely
@@ -591,14 +889,16 @@ class TextInjector:
             )
             # Bridging Wayland DEs (GNOME): inject_text() switches to the
             # real vocalinux engine for each commit, so a bare xkb:* baseline is
-            # fine (#501, #504). KDE is not in that set unless IBus is already
-            # the session IM: a leftover daemon plus scoped activate reports
-            # success while Kate/Qt get nothing (#752). Unbridged compositors
-            # still bail below.
+            # fine (#501, #504). KDE joins that set only when KWin's Virtual
+            # Keyboard is confirmed on: a confirmed VK bridge is what makes the
+            # commits reach apps, and it is also what keeps the #752
+            # leftover-daemon trap (scoped activate reports success while
+            # Kate/Qt get nothing) excluded when the VK check fails (#911).
+            # Unbridged compositors still bail below.
             wayland_scoped_ibus = (
                 self.environment == DesktopEnvironment.WAYLAND
                 and not explicit_non_ibus_im
-                and not _is_kde_plasma_session()
+                and (not _is_kde_plasma_session() or self._kde_virtual_keyboard_enabled())
             )
 
             # Check if IBus is the active input method (not just installed)
@@ -629,6 +929,20 @@ class TextInjector:
                     os.environ.get("XDG_CURRENT_DESKTOP", "unknown"),
                 )
             else:
+                # force_ibus short-circuits all three guards above, so a pinned
+                # run arrives here without any of them having been evaluated.
+                # This warns for the compositor guard only: that is the case
+                # with a documented silent failure (#478, #485), where IBus
+                # reports the commit as delivered and the text never arrives.
+                # The other two guards are out of scope for this warning.
+                if force_ibus and not self._wayland_compositor_bridges_ibus():
+                    logger.warning(
+                        "Compositor '%s' does not bridge IBus to native Wayland apps, but an "
+                        "explicit ibus pin overrides that check. Dictation may silently do "
+                        "nothing in native Wayland windows; remove the pin to fall back to "
+                        "wtype/ydotool.",
+                        os.environ.get("XDG_CURRENT_DESKTOP", "unknown"),
+                    )
                 try:
                     if wayland_scoped_ibus and not ibus_active:
                         logger.info(
@@ -652,22 +966,54 @@ class TextInjector:
             wtype_available = shutil.which("wtype") is not None
             ydotool_available = shutil.which("ydotool") is not None
             xdotool_available = shutil.which("xdotool") is not None
+            # A pinned wtype/ydotool that is installed is honoured without
+            # autodetection, so probing the portal -- a session-bus round
+            # trip on a private worker -- is skipped for those users.
+            pinned_tool_present = (forced == "wtype" and wtype_available) or (
+                forced == "ydotool" and ydotool_available
+            )
+            portal_available = not pinned_tool_present and self._portal_probe()
 
             if ydotool_available:
                 _warn_if_ydotool_globally_enabled()
 
             # Prefer ydotool when the daemon is (or can be) ready. Flatpak ships
             # ydotool for native Wayland typing; wtype needs a Wayland socket.
-            if forced == "wtype" and wtype_available:
+            # The RemoteDesktop portal sits ahead of both in autodetection: it
+            # is the only injection path Wayland sanctions, works inside the
+            # Flatpak sandbox without /dev/uinput, and reaches native clients
+            # on compositors with no input-method-v2 bridge. KDE is the
+            # exception: KWin's portal scrambles letter case (#911), so on
+            # Plasma a present ydotool goes first -- the ordering from before
+            # the portal backend existed.
+            kde_ydotool_first = ydotool_available and _is_kde_plasma_session()
+            if forced == "portal" and portal_available:
+                self._select_portal_backend(
+                    "%s=portal: using RemoteDesktop portal for Wayland injection",
+                    pin_source,
+                )
+            elif forced == "wtype" and wtype_available:
                 self.wayland_tool = "wtype"
-                logger.info("VOCALINUX_FORCE_BACKEND=wtype: using wtype for Wayland injection")
+                logger.info("%s=wtype: using wtype for Wayland injection", pin_source)
             elif forced == "ydotool" and ydotool_available:
                 self._ensure_ydotoold()
                 self.wayland_tool = "ydotool"
-                logger.info("VOCALINUX_FORCE_BACKEND=ydotool: using ydotool for Wayland injection")
+                logger.info("%s=ydotool: using ydotool for Wayland injection", pin_source)
+            elif portal_available and not kde_ydotool_first:
+                self._select_portal_backend(
+                    "Using the RemoteDesktop portal for Wayland text injection"
+                )
             elif ydotool_available and self._ensure_ydotoold():
                 self.wayland_tool = "ydotool"
                 logger.info("Using ydotool for Wayland text injection")
+            elif portal_available:
+                # Reached only on KDE after ydotool proved unusable; on other
+                # desktops the earlier portal branch already fired. A daemonless
+                # ydotool must not outrank a working portal: it may fail at
+                # injection time (no /dev/uinput), while the portal delivers.
+                self._select_portal_backend(
+                    "Using the RemoteDesktop portal for Wayland text injection"
+                )
             elif ydotool_available and not wtype_available:
                 self.wayland_tool = "ydotool"
                 logger.warning(
@@ -703,6 +1049,156 @@ class TextInjector:
 
         if ibus_requested:
             self._start_ibus_initialization()
+
+    def _portal_probe(self) -> bool:
+        """Check whether the RemoteDesktop portal can inject keyboard events.
+
+        The client is created lazily and cached on first success so
+        ``wayland_tool == "portal"`` reuses the same connection/worker. The
+        probe itself only asks the portal for its interface version; the
+        session handshake (and its one-time permission prompt) is deferred
+        to the first actual injection.
+        """
+        # getattr: __new__-constructed injectors (tests) lack __init__ attrs.
+        portal = getattr(self, "_portal", None)
+        if portal is None:
+            if not RemoteDesktopPortal.supported():
+                return False
+            try:
+                portal = RemoteDesktopPortal()
+            except Exception as e:
+                logger.debug(f"Could not create the RemoteDesktop portal client: {e}")
+                return False
+        try:
+            if portal.probe():
+                self._portal = portal
+                return True
+        except Exception as e:
+            logger.debug(f"RemoteDesktop portal probe failed: {e}")
+        return False
+
+    def _select_portal_backend(self, log_message: str, *args: object) -> None:
+        """Select the RemoteDesktop portal as the Wayland injection tool."""
+        self.wayland_tool = "portal"
+        if self.environment == DesktopEnvironment.WAYLAND_XDOTOOL:
+            # The portal reaches native Wayland clients, not just XWayland, so
+            # a Flatpak session that demoted to XWayland upgrades back.
+            self.environment = DesktopEnvironment.WAYLAND
+        logger.info(log_message, *args)
+
+    def _try_inject_with_portal(self, text: str) -> Tuple[bool, Optional[str]]:
+        """Send text through the RemoteDesktop portal.
+
+        Returns ``(True, "")`` on success. On failure the second element is
+        the part of ``text`` the portal had not typed yet -- the whole string
+        when it never got started, the tail when it failed mid-string -- so
+        the fallback backend does not duplicate delivered characters. It is
+        ``None`` when the job timed out without reporting its count: whatever
+        reached the compositor is then unknowable and nothing may be replayed.
+        """
+        portal = getattr(self, "_portal", None)
+        if portal is None:
+            return False, text
+        try:
+            return bool(portal.inject_text(text)), ""
+        except RemoteDesktopPortalError as e:
+            logger.warning(f"RemoteDesktop portal injection failed: {e}")
+            if e.delivered is None:
+                return False, None
+            return False, text[e.delivered :]
+        except Exception as e:
+            logger.warning(f"RemoteDesktop portal injection failed: {e}")
+            return False, text
+
+    def _try_portal_keypress(self, keysym: int, count: int = 1) -> Tuple[bool, Optional[int]]:
+        """Tap one keysym ``count`` times through the portal.
+
+        Returns ``(True, 0)`` on success; on failure the taps still owed, so
+        the fallback does not re-send presses the portal already delivered.
+        ``None`` means a timed-out job never reported its count, so no part
+        of the request may be replayed.
+        """
+        portal = getattr(self, "_portal", None)
+        if portal is None:
+            return False, count
+        try:
+            portal.tap_keysym(keysym, count)
+            return True, 0
+        except RemoteDesktopPortalError as e:
+            logger.warning(f"RemoteDesktop portal key event failed: {e}")
+            if e.delivered is None:
+                return False, None
+            return False, max(0, count - e.delivered)
+        except Exception as e:
+            logger.warning(f"RemoteDesktop portal key event failed: {e}")
+            return False, count
+
+    def _try_portal_shortcut(
+        self, steps: List[Tuple[List[str], str]]
+    ) -> Tuple[bool, Optional[List[Tuple[List[str], str]]]]:
+        """Send parsed shortcut steps through the portal.
+
+        Returns ``(True, [])`` on success; on failure the steps still to
+        send, so the fallback does not re-run steps that already fired.
+        ``None`` means a timed-out job never reported its count, so no step
+        may be replayed.
+        """
+        portal = getattr(self, "_portal", None)
+        if portal is None:
+            return False, steps
+        try:
+            portal.send_shortcut(steps)
+            return True, []
+        except RemoteDesktopPortalError as e:
+            logger.warning(f"RemoteDesktop portal shortcut failed: {e}")
+            if e.delivered is None:
+                return False, None
+            return False, list(steps[e.delivered :])
+        except Exception as e:
+            logger.warning(f"RemoteDesktop portal shortcut failed: {e}")
+            return False, list(steps)
+
+    def _demote_portal_backend(self) -> bool:
+        """Drop the portal for this run and pick the next Wayland tool.
+
+        Mirrors the startup preference: ydotool with a ready daemon, then
+        ydotool alone when wtype is absent, then wtype, then the XWayland
+        fallback. Returns False when nothing else exists, leaving the
+        clipboard fallback to report the failure.
+        """
+        portal = getattr(self, "_portal", None)
+        if portal is not None:
+            try:
+                portal.close()
+            except Exception as e:
+                logger.debug(f"Could not close RemoteDesktop portal client: {e}")
+            self._portal = None
+        with self._state_lock:
+            self.wayland_tool = None
+
+        ydotool_available = shutil.which("ydotool") is not None
+        wtype_available = shutil.which("wtype") is not None
+        xdotool_available = shutil.which("xdotool") is not None
+
+        tool = None
+        if ydotool_available and self._ensure_ydotoold():
+            tool = "ydotool"
+        elif ydotool_available and not wtype_available:
+            tool = "ydotool"
+        elif wtype_available:
+            tool = "wtype"
+        elif xdotool_available:
+            with self._state_lock:
+                self.environment = DesktopEnvironment.WAYLAND_XDOTOOL
+            logger.warning("RemoteDesktop portal failed; using xdotool/XWayland fallback")
+            return True
+        else:
+            return False
+
+        with self._state_lock:
+            self.wayland_tool = tool
+        logger.warning(f"RemoteDesktop portal failed; falling back to {tool}")
+        return True
 
     def _start_ibus_initialization(self) -> None:
         if self._ibus_injector is None or self._ibus_init_thread is not None:
@@ -1089,6 +1585,17 @@ class TextInjector:
         except Exception as e:
             logger.debug(f"Could not show clipboard notification: {e}")
 
+    def abort_injections(self) -> None:
+        """Ask in-flight injections to stop at their next safe boundary.
+
+        Called on application quit so a worker holding the injection lock
+        finishes promptly: chunk loops and the Wayland typing call poll the
+        flag and raise ``_InjectionAborted`` instead of running to
+        completion, while every subprocess that is already in flight still
+        returns on its own timeout.
+        """
+        self._abort_injections.set()
+
     def inject_text(self, text: str) -> bool:
         """
         Inject text into the currently focused application.
@@ -1099,9 +1606,14 @@ class TextInjector:
         Returns:
             True if injection was successful, False otherwise
         """
+        self.last_typed_count = 0
+
         if not text or not text.strip():
             logger.debug("Empty text provided, skipping injection")
             return True
+
+        if self._abort_injections.is_set():
+            return False
 
         logger.info(f"Starting text injection: '{text}' (length: {len(text)})")
         logger.debug(f"Environment: {self.environment}")
@@ -1165,6 +1677,11 @@ class TextInjector:
                 try:
                     self._inject_with_wayland_tool(text)
                 except subprocess.CalledProcessError as e:
+                    # A chunked type call may have delivered a prefix; the
+                    # fallback continues from the untyped remainder so text
+                    # already on screen is never sent a second time.
+                    typed = e.typed if isinstance(e, _PartiallyTyped) else 0
+                    remaining = text[typed:]
                     stderr_msg = e.stderr.strip() if e.stderr else "No stderr output"
                     unsupported_wayland = (
                         "compositor does not support" in str(e).lower()
@@ -1188,7 +1705,11 @@ class TextInjector:
                         )
                         with self._state_lock:
                             self.environment = DesktopEnvironment.WAYLAND_XDOTOOL
-                        self._inject_with_xdotool(text)
+                        try:
+                            self._inject_with_xdotool(remaining)
+                        except _PartiallyTyped as nested:
+                            # Keep the count relative to the original text.
+                            raise _PartiallyTyped(typed + nested.typed, nested) from nested
                     else:
                         raise
             logger.info("Text injection completed successfully")
@@ -1200,7 +1721,44 @@ class TextInjector:
                     daemon=True,
                 ).start()
 
+            self.last_typed_count = len(text)
             return True
+        except _InjectionAborted:
+            self.last_typed_count = -1
+            logger.info("Injection aborted by shutdown")
+            return False
+        except _PartiallyTyped as e:
+            # A prefix is already on screen; the clipboard fallback must hold
+            # only the untyped remainder or a manual paste duplicates it.
+            # Reporting success would mark the whole transcription injected,
+            # so "delete that" could erase text before the typed prefix.
+            logger.error(f"Text injection failed after a prefix was typed: {e}")
+            self.last_typed_count = e.typed
+            remaining = text[e.typed :]
+            try:
+                if self._copy_to_clipboard(remaining):
+                    logger.info(
+                        "Remaining text copied to clipboard as fallback - user can paste manually"
+                    )
+                    self._show_clipboard_fallback_notification()
+            except (OSError, subprocess.SubprocessError, RuntimeError) as clipboard_error:
+                logger.debug(f"Clipboard fallback also failed: {clipboard_error}")
+
+            try:
+                from ..ui.audio_feedback import play_error_sound
+
+                play_error_sound()
+            except ImportError:
+                logger.warning("Could not import audio feedback module")
+            return False
+        except subprocess.TimeoutExpired as e:
+            # A type call that ran past its bound may have delivered only part
+            # of the text; putting the full text on the clipboard would let a
+            # manual paste duplicate the fragment already typed.  How much
+            # arrived is unknowable, so the caller must not trust any count.
+            self.last_typed_count = -1
+            logger.error(f"Text injection timed out, text may be partially typed: {e}")
+            return False
         except Exception as e:
             logger.error(f"Failed to inject text: {e}", exc_info=True)
 
@@ -1209,7 +1767,7 @@ class TextInjector:
                     logger.info("Text copied to clipboard as fallback - user can paste manually")
                     self._show_clipboard_fallback_notification()
                     return True
-            except Exception as clipboard_error:
+            except (OSError, subprocess.SubprocessError, RuntimeError) as clipboard_error:
                 logger.debug(f"Clipboard fallback also failed: {clipboard_error}")
 
             try:
@@ -1261,6 +1819,7 @@ class TextInjector:
                     stderr=subprocess.PIPE,
                     text=True,
                     check=False,
+                    timeout=2,
                 )
 
                 if active_window.returncode == 0 and active_window.stdout.strip():
@@ -1272,6 +1831,7 @@ class TextInjector:
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
                         check=False,
+                        timeout=5,
                     )
                     # Wait a moment for the focus to take effect
                     time.sleep(0.2)
@@ -1283,6 +1843,9 @@ class TextInjector:
             max_retries = 2
             logger.debug(f"Starting xdotool injection with {max_retries} max retries")
 
+            # Retries resume at the first untyped chunk: restarting from the
+            # top would duplicate the chunks a failed attempt already sent.
+            typed = 0
             for retry in range(max_retries + 1):
                 try:
                     # Inject in smaller chunks to avoid issues with very long text
@@ -1292,12 +1855,18 @@ class TextInjector:
                         f"Splitting text into {total_chunks} chunks of max {chunk_size} chars"
                     )
 
-                    for i in range(0, len(text), chunk_size):
+                    for i in range(typed, len(text), chunk_size):
+                        if self._abort_injections.is_set():
+                            raise _InjectionAborted
                         chunk = text[i : i + chunk_size]
                         chunk_num = (i // chunk_size) + 1
 
-                        # First try with clearmodifiers
-                        cmd = ["xdotool", "type", "--clearmodifiers", chunk]
+                        # First try with clearmodifiers. ``--`` ends option
+                        # parsing: a chunk that starts with '-' (a word
+                        # hyphenated across the chunk boundary) is typed
+                        # literally instead of read as a flag and rejected
+                        # (#921).
+                        cmd = ["xdotool", "type", "--clearmodifiers", "--", chunk]
                         logger.debug(f"Injecting chunk {chunk_num}/{total_chunks}: '{chunk}'")
 
                         subprocess.run(
@@ -1308,6 +1877,7 @@ class TextInjector:
                             text=True,
                             timeout=5,
                         )
+                        typed = min(i + chunk_size, len(text))
 
                         # Add a larger delay between chunks
                         if i + chunk_size < len(text):
@@ -1326,7 +1896,9 @@ class TextInjector:
                         time.sleep(0.5)  # Wait before retry
                     else:
                         logger.error(f"Final attempt failed: {chunk_error.stderr}")
-                        raise  # Re-raise on final attempt
+                        # typed counts only completed chunks, so the
+                        # clipboard fallback gets the untyped remainder.
+                        raise _PartiallyTyped(typed, chunk_error) from chunk_error
                 except subprocess.TimeoutExpired:
                     if retry < max_retries:
                         logger.warning(
@@ -1358,6 +1930,7 @@ class TextInjector:
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     check=False,
+                    timeout=2,
                 )
             except Exception:
                 pass  # Ignore any errors from this command
@@ -1535,6 +2108,8 @@ class TextInjector:
                 "terminal" if use_terminal_paste else "standard",
                 paste_cmd,
             )
+            if self._abort_injections.is_set():
+                raise _InjectionAborted
             subprocess.run(
                 paste_cmd,
                 check=True,
@@ -2022,8 +2597,40 @@ class TextInjector:
         """
         # Wait for the shortcut modifier(s) to be released first, so a held Alt
         # doesn't turn the Ctrl+V paste into Ctrl+Alt+V (nothing pastes) or
-        # modify typed keys.
+        # modify typed keys. The portal's keysyms are equally affected by a
+        # still-held physical modifier, so the wait stays ahead of every tool.
         self._wait_for_modifiers_released()
+
+        # Characters the portal confirmed before a demote: partial-type counts
+        # raised later are relative to the shortened text and must be rebased
+        # by this prefix or the caller replays delivered input.
+        typed_prefix = 0
+
+        if self.wayland_tool == "portal":
+            portal_ok, remaining_text = self._try_inject_with_portal(text)
+            if portal_ok:
+                return
+            if not self._demote_portal_backend():
+                raise RuntimeError(
+                    "RemoteDesktop portal injection failed and no Wayland fallback is available"
+                )
+            if remaining_text is None:
+                # The timed-out job never reported its delivered count, so
+                # retyping any part could duplicate what already arrived.
+                # Surface as a timeout: the caller drops the injection rather
+                # than offering a clipboard copy of the full text.
+                raise subprocess.TimeoutExpired(cmd="portal", timeout=_PORTAL_SUBMIT_TIMEOUT_S)
+            if not remaining_text:
+                return
+            typed_prefix = len(text) - len(remaining_text)
+            if self.environment == DesktopEnvironment.WAYLAND_XDOTOOL:
+                try:
+                    self._inject_with_xdotool(remaining_text)
+                except _PartiallyTyped as nested:
+                    # Keep the count relative to the original text.
+                    raise _PartiallyTyped(typed_prefix + nested.typed, nested) from nested
+                return
+            text = remaining_text
 
         # Prefer clipboard + paste chord for ydotool: one chord instead of
         # per-character evdev keycodes (those follow physical US key positions
@@ -2046,21 +2653,51 @@ class TextInjector:
                 "(character-by-character; text may be scrambled on non-US layouts)"
             )
 
-        if self.wayland_tool == "wtype":
-            cmd = ["wtype", text]
-        else:  # ydotool
-            # Keep key-delay > 0 to avoid Shift-leak ("Can you" -> "CAN YOu").
-            # Low delay so fallback typing finishes quickly for long phrases.
-            key_delay = os.environ.get("VOCALINUX_YDOTOOL_KEY_DELAY", "2")
-            cmd = ["ydotool", "type", "--key-delay", key_delay, text]
-
-        try:
-            subprocess.run(cmd, check=True, stderr=subprocess.PIPE, text=True, env=host_env())
-        except subprocess.CalledProcessError as e:
-            # Re-raise with stderr preserved for better diagnostics
-            raise subprocess.CalledProcessError(
-                e.returncode, e.cmd, output=e.output, stderr=e.stderr
-            ) from e
+        # Type in chunks so shutdown can abort between subprocess calls — one
+        # whole-string call could not be interrupted for its full
+        # length-scaled duration.  Each chunk's budget is a generous multiple
+        # of its expected duration: a legitimately slow type must never be cut
+        # mid-text — only a stall far beyond it is.
+        chunk_size = 200
+        for i in range(0, len(text), chunk_size):
+            if self._abort_injections.is_set():
+                raise _InjectionAborted
+            chunk = text[i : i + chunk_size]
+            if self.wayland_tool == "wtype":
+                # ``--`` puts wtype in raw-text mode so a leading '-' is not
+                # parsed as an option.
+                cmd = ["wtype", "--", chunk]
+                # wtype types at compositor pace; the budget scales with the
+                # chunk length so only a wedged process can ever hit it.
+                type_timeout = max(5, len(chunk) * 0.05)
+            else:  # ydotool
+                # Keep key-delay > 0 to avoid Shift-leak ("Can you" -> "CAN YOu").
+                # Low delay so fallback typing finishes quickly for long phrases.
+                key_delay = os.environ.get("VOCALINUX_YDOTOOL_KEY_DELAY", "2")
+                # ``--`` ends ydotool's option parsing for the same reason.
+                cmd = ["ydotool", "type", "--key-delay", key_delay, "--", chunk]
+                type_timeout = max(5, len(chunk) * self._key_delay_seconds(key_delay) * 4)
+            try:
+                subprocess.run(
+                    cmd,
+                    check=True,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=type_timeout,
+                    env=host_env(),
+                )
+            except subprocess.TimeoutExpired:
+                logger.error(f"{self.wayland_tool} type timed out; text may be partially typed")
+                raise
+            except subprocess.CalledProcessError as e:
+                if i > 0:
+                    # Earlier chunks are already on screen; let the caller
+                    # continue from the untyped remainder.
+                    raise _PartiallyTyped(typed_prefix + i, e) from e
+                # Re-raise with stderr preserved for better diagnostics
+                raise subprocess.CalledProcessError(
+                    e.returncode, e.cmd, output=e.output, stderr=e.stderr
+                ) from e
 
         logger.info(
             f"Text injected using {self.wayland_tool}: '{text[:20]}...' ({len(text)} chars)"
@@ -2077,6 +2714,9 @@ class TextInjector:
             True if injection was successful, False otherwise
         """
         logger.debug(f"Injecting keyboard shortcut: {shortcut}")
+
+        if self._abort_injections.is_set():
+            return False
 
         try:
             if (
@@ -2120,11 +2760,21 @@ class TextInjector:
 
         try:
             cmd = ["xdotool", "key", "--clearmodifiers", shortcut]
-            subprocess.run(cmd, env=host_env(env), check=True, stderr=subprocess.PIPE, text=True)
+            subprocess.run(
+                cmd,
+                env=host_env(env),
+                check=True,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=5,
+            )
             logger.debug(f"Keyboard shortcut '{shortcut}' injected successfully")
             return True
         except subprocess.CalledProcessError as e:
             logger.error(f"xdotool shortcut error: {e.stderr}")
+            return False
+        except subprocess.TimeoutExpired:
+            logger.error(f"xdotool shortcut timed out: '{shortcut}'")
             return False
 
     def _inject_shortcut_with_wayland_tool(self, shortcut: str) -> bool:
@@ -2146,6 +2796,28 @@ class TextInjector:
         # A held toggle/PTT modifier rewrites the chord we are about to send, so
         # wait it out first -- same reason and placement as _inject_with_wayland_tool.
         self._wait_for_modifiers_released()
+
+        # Characters the portal confirmed before a demote: partial-type counts
+        # raised later are relative to the shortened text and must be rebased
+        # by this prefix or the caller replays delivered input.
+        typed_prefix = 0
+
+        if self.wayland_tool == "portal":
+            portal_ok, remaining_steps = self._try_portal_shortcut(steps)
+            if portal_ok:
+                return True
+            if not self._demote_portal_backend():
+                return False
+            if remaining_steps is None:
+                # Untracked delivery: replaying the shortcut could trigger
+                # actions the timed-out job already sent.
+                return False
+            if not remaining_steps:
+                return True
+            steps = remaining_steps
+            if self.environment == DesktopEnvironment.WAYLAND_XDOTOOL:
+                return self._inject_shortcut_with_xdotool(self._steps_to_shortcut(steps))
+            # Fall through to the demoted wtype/ydotool.
 
         if self.wayland_tool == "wtype":
             # wtype does support combinations: -M presses a modifier, -k types a
@@ -2341,6 +3013,15 @@ class TextInjector:
             raise ValueError("no key found")
         return steps
 
+    @staticmethod
+    def _steps_to_shortcut(steps: List[Tuple[List[str], str]]) -> str:
+        """Render parsed ``_parse_shortcut`` steps back as a ``+``-joined string.
+
+        Used to hand only the unsent tail of a partially delivered shortcut
+        to the xdotool fallback, which takes a shortcut string, not steps.
+        """
+        return "+".join("+".join(modifiers + [key]) for modifiers, key in steps)
+
     def press_backspace(self, count: int) -> bool:
         """Send ``count`` real BackSpace key events.
 
@@ -2356,6 +3037,9 @@ class TextInjector:
         """
         if count <= 0:
             return True
+
+        if self._abort_injections.is_set():
+            return False
 
         logger.debug(f"Sending {count} backspace key event(s)")
 
@@ -2398,6 +3082,20 @@ class TextInjector:
         if not tool:
             logger.error("No virtual-keyboard tool available to send backspaces")
             return False
+
+        if tool == "portal":
+            portal_ok, remaining = self._try_portal_keypress(KEYSYM_BACKSPACE, count)
+            if portal_ok:
+                return True
+            if not self._demote_portal_backend():
+                return False
+            if remaining is None:
+                # Untracked delivery: replaying presses could delete text the
+                # timed-out job already removed.
+                return False
+            if remaining <= 0:
+                return True
+            return self.press_backspace(remaining)
 
         if tool == "ydotool" and not self._ensure_ydotoold():
             # Checked on every call, not just when the tool is first resolved:

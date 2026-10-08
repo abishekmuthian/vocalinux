@@ -17,9 +17,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from vocalinux.utils import model_checksums
-from vocalinux.utils.faster_whisper_model_info import (
-    FASTER_WHISPER_MODEL_INFO,
-)
+from vocalinux.utils.faster_whisper_model_info import FASTER_WHISPER_MODEL_INFO
 from vocalinux.utils.faster_whisper_model_info import manifest_key as faster_whisper_manifest_key
 from vocalinux.utils.faster_whisper_model_info import model_files as faster_whisper_model_files
 from vocalinux.utils.model_checksums import (
@@ -34,15 +32,21 @@ from vocalinux.utils.model_checksums import (
     whispercpp_revision,
     write_verification_stamp,
 )
-from vocalinux.utils.parakeet_model_info import MODEL_FILES, PARAKEET_MODEL_INFO, manifest_key
+from vocalinux.utils.parakeet_model_info import PARAKEET_MODEL_INFO, manifest_key, model_files
 from vocalinux.utils.vosk_model_info import VOSK_MODEL_INFO
 from vocalinux.utils.whispercpp_model_info import (
     WHISPERCPP_MODEL_INFO,
     whispercpp_model_file,
+    whispercpp_model_source,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 INSTALL_SH = REPO_ROOT / "install.sh"
+INSTALLER_MODULES = REPO_ROOT / "install.d"
+INSTALLER_SOURCE = "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in (INSTALL_SH, *sorted(INSTALLER_MODULES.glob("*.sh")))
+)
 
 
 class TestManifestCoverage(unittest.TestCase):
@@ -84,7 +88,7 @@ class TestManifestCoverage(unittest.TestCase):
         missing = [
             manifest_key(name, filename)
             for name in PARAKEET_MODEL_INFO
-            for filename in MODEL_FILES
+            for filename in model_files(name)
             if manifest_key(name, filename) not in pinned
         ]
         self.assertEqual(
@@ -125,9 +129,12 @@ class TestManifestCoverage(unittest.TestCase):
         self.assertRegex(revision, r"^[0-9a-f]{40}$")
 
     def test_download_urls_use_the_pinned_revision(self):
+        # Models hosted outside ggerganov/whisper.cpp (e.g. TinyDiarize) pin
+        # their own repo's commit instead of the main-repo revision.
         revision = whispercpp_revision()
         for name, info in WHISPERCPP_MODEL_INFO.items():
-            self.assertIn(f"/resolve/{revision}/", info["url"], name)
+            _, model_revision = whispercpp_model_source(name)
+            self.assertIn(f"/resolve/{model_revision or revision}/", info["url"], name)
 
 
 class TestVerifyFile(unittest.TestCase):
@@ -227,7 +234,7 @@ INSTALL_DIR="%s"
     )
 
     def _source(self) -> str:
-        text = INSTALL_SH.read_text()
+        text = INSTALLER_SOURCE
         chunks = []
         for name in self.FUNCTIONS:
             start = text.index(f"\n{name}() {{")
@@ -353,7 +360,7 @@ class TestExistingModelsAreVerified(unittest.TestCase):
     every install predating checksum verification — kept an unverified model.
     """
 
-    SOURCE = INSTALL_SH.read_text()
+    SOURCE = INSTALLER_SOURCE
 
     def _function_body(self, name: str) -> str:
         start = self.SOURCE.index(f"\n{name}() {{")
@@ -427,7 +434,7 @@ class TestVerificationStamp(unittest.TestCase):
     """
 
     def test_the_installer_uses_the_same_stamp_name(self):
-        self.assertIn(VERIFICATION_STAMP_NAME, INSTALL_SH.read_text())
+        self.assertIn(VERIFICATION_STAMP_NAME, INSTALLER_SOURCE)
 
     def test_it_records_the_pinned_digest_of_the_archive(self):
         with TemporaryDirectory() as tree:
@@ -524,7 +531,7 @@ download_model_file() {
         curl.chmod(0o755)
 
     def _source(self) -> str:
-        text = INSTALL_SH.read_text()
+        text = INSTALLER_SOURCE
         chunks = []
         for name in self.FUNCTIONS:
             start = text.index(f"\n{name}() {{")
@@ -614,7 +621,7 @@ class TestReleaseWithoutAManifest(unittest.TestCase):
     first run. A manifest that omits a model still fails closed.
     """
 
-    SOURCE = INSTALL_SH.read_text()
+    SOURCE = INSTALLER_SOURCE
 
     PRELUDE = """
 set -uo pipefail
